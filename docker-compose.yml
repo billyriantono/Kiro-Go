@@ -12,7 +12,12 @@ services:
       # host browser's localhost:3128 reach the container listener below.
       - "127.0.0.1:3128:3128"
     volumes:
-      - ./data:/app/data
+      # Named volume, NOT a relative bind mount: platforms that re-clone the repo
+      # per deployment (Dokploy and most git-based deployers) would otherwise
+      # point ./data at a fresh empty directory on every deploy and lose all
+      # accounts/settings. The named volume is keyed to the compose project name,
+      # so it survives rebuilds and redeployments. Never run `compose down -v`.
+      - kiro-data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
       # Bind host for the Enterprise SSO callback listener INSIDE the container.
@@ -25,3 +30,6 @@ services:
       # KIRO_SSO_CALLBACK_BIND to a specific interface or isolate the network.
       - KIRO_SSO_CALLBACK_BIND=0.0.0.0
     restart: unless-stopped
+
+volumes:
+  kiro-data:
