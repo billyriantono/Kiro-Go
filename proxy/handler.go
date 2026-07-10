@@ -3112,6 +3112,13 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	email := req.Email
 	if req.AuthMethod == "external_idp" && req.AccessToken != "" {
 		if exp := auth.ExpFromAccessTokenJWT(req.AccessToken); exp > 0 {
+			// The exp comes from an UNVERIFIED JWT: clamp it to a sane horizon so a
+			// crafted far-future exp cannot pin a dead token as forever-valid (the
+			// background refresh would otherwise never renew it). Azure AD access
+			// tokens live ~1h; 24h is a generous ceiling.
+			if maxExp := time.Now().Add(24 * time.Hour).Unix(); exp > maxExp {
+				exp = maxExp
+			}
 			accessToken = req.AccessToken
 			expiresAt = exp
 			profileArn = req.ProfileArn
@@ -3226,12 +3233,15 @@ func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint
 	switch {
 	case externalIdpAuthMethodAliases[am]:
 		return "external_idp"
-	case tokenEndpoint != "": // infer when not declared explicitly
-		return "external_idp"
 	case am == "social" || am == "google" || am == "github":
 		return "social"
 	case am == "idc" || am == "builderid" || am == "enterprise":
 		return "idc"
+	case tokenEndpoint != "":
+		// Infer external_idp from a tokenEndpoint only when authMethod does not
+		// explicitly say otherwise — a stray tokenEndpoint key in a pasted social/
+		// idc record must not silently flip the account to external_idp.
+		return "external_idp"
 	}
 	if am == "" {
 		if clientID != "" {
@@ -3250,11 +3260,11 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"version":         config.Version,
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
-		"totalRequests":   h.totalRequests,
-		"successRequests": h.successRequests,
-		"failedRequests":  h.failedRequests,
-		"totalTokens":     h.totalTokens,
-		"totalCredits":    h.totalCredits,
+		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
+		"successRequests": atomic.LoadInt64(&h.successRequests),
+		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":    h.getCredits(),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }

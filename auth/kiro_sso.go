@@ -104,8 +104,16 @@ type KiroSsoSession struct {
 	closeOnce sync.Once
 	timer     *time.Timer // deadline self-teardown; freed in close()
 
-	mu   sync.Mutex
-	leg2 *kiroLeg2 // set when the enterprise descriptor arrives
+	mu     sync.Mutex
+	leg2   *kiroLeg2 // set when the enterprise descriptor arrives
+	closed bool      // set in close(); a closed session no longer holds the port
+}
+
+// isActive reports whether the session still holds the loopback listener.
+func (s *KiroSsoSession) isActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.closed
 }
 
 // kiroLeg2 is the per-attempt state captured when the enterprise descriptor
@@ -165,6 +173,13 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 		region = "us-east-1"
 	}
 
+	// The redirect port is fixed, so only one sign-in can be in flight at a
+	// time. Fail with an actionable message instead of the generic bind error
+	// so the operator knows to cancel (or wait out) the other login.
+	if hasActiveKiroSsoSession() {
+		return nil, "", fmt.Errorf("an SSO login is already in progress; cancel it or wait for it to finish before starting a new one")
+	}
+
 	verifier := generateCodeVerifier()
 	challenge := generateCodeChallenge(verifier)
 	state := uuid.New().String()
@@ -195,14 +210,18 @@ func StartKiroSsoLogin(region string) (*KiroSsoSession, string, error) {
 	kiroSsoSessions[session.ID] = session
 	kiroSsoSessionsMu.Unlock()
 
-	// Self-teardown at the deadline: free the loopback listener and drop the
-	// session even if the operator abandons the sign-in and the front end stops
-	// polling. Without this an abandoned login would hold 127.0.0.1:3128 until the
-	// process restarts and block every subsequent SSO login (the redirect port is
-	// fixed, so only one sign-in can use it at a time).
+	// Self-teardown at the deadline: free the loopback listener even if the
+	// operator abandons the sign-in and the front end stops polling. Without this
+	// an abandoned login would hold 127.0.0.1:3128 until the process restarts and
+	// block every subsequent SSO login (the redirect port is fixed, so only one
+	// sign-in can use it at a time). The timeout is delivered through resultCh —
+	// not by removing the session — so a poll racing the deadline reads the
+	// definitive "timed out" instead of "session not found"; the map entry is
+	// dropped after a grace window in case the front end never polls again.
 	session.timer = time.AfterFunc(kiroSsoLoginTimeout, func() {
+		session.deliver(kiroSsoCapture{err: fmt.Errorf("SSO login timed out after %s", kiroSsoLoginTimeout)})
 		session.close()
-		removeKiroSsoSession(session.ID)
+		time.AfterFunc(time.Minute, func() { removeKiroSsoSession(session.ID) })
 	})
 
 	return session, signInURL, nil
@@ -231,11 +250,9 @@ func PollKiroSsoAuth(sessionID string) (*KiroSsoResult, string, error) {
 		}
 		return session.exchange(capture)
 	default:
-		if time.Now().After(session.ExpiresAt) {
-			session.close()
-			removeKiroSsoSession(sessionID)
-			return nil, "", fmt.Errorf("SSO login timed out after %s", kiroSsoLoginTimeout)
-		}
+		// The deadline AfterFunc delivers the timeout through resultCh, so an
+		// expired session is picked up by the select above on the next poll —
+		// no separate deadline check here (which raced the AfterFunc teardown).
 		return nil, "pending", nil
 	}
 }
@@ -350,6 +367,9 @@ func (s *KiroSsoSession) close() {
 		if s.srv != nil {
 			_ = s.srv.Close()
 		}
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
 	})
 }
 
@@ -389,6 +409,17 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 	// cannot be routed here and reset an in-flight leg-2.
 	if req.URL.Path != kiroOAuthCallbackPath &&
 		(strings.EqualFold(strings.TrimSpace(q.Get("login_option")), "external_idp") || strings.TrimSpace(q.Get("issuer_url")) != "") {
+		// Anti-CSRF: the descriptor must echo the portal state, exactly like the
+		// social leg below. Without this, any peer able to reach the listener
+		// during the login window (e.g. another container when the callback is
+		// bound to 0.0.0.0) could inject a forged descriptor, pre-empting the
+		// single-shot leg-2 and steering the browser to an attacker-chosen
+		// client_id/login_hint on the IdP.
+		if state := strings.TrimSpace(q.Get("state")); s.State == "" || state != s.State {
+			logger.Warnf("[KiroSSO] enterprise IdP descriptor rejected: missing or mismatched state")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		// Single-shot: once a leg-2 is in flight, ignore further descriptors so a
 		// stray or forged local request cannot reset/hijack the active login.
 		s.mu.Lock()
@@ -409,7 +440,7 @@ func (s *KiroSsoSession) handleCallback(w http.ResponseWriter, req *http.Request
 		}
 		// oidcDiscover validates the issuer + both discovered endpoints against
 		// the IdP host allow-list, so the issuer here is not trusted blindly.
-		authEndpoint, tokenEndpoint, errDisc := oidcDiscover(GetAuthClientForProxy(s.ProxyURL), issuerURL, s.ProxyURL)
+		authEndpoint, tokenEndpoint, errDisc := oidcDiscover(issuerURL, s.ProxyURL)
 		if errDisc != nil {
 			writeKiroCallbackPage(w, false)
 			s.deliver(kiroSsoCapture{err: errDisc})
@@ -633,6 +664,9 @@ func DeriveExternalIdpEndpoints(userId, clientID, accessToken string) (tokenEndp
 		return "", "", ""
 	}
 	tenant := segments[0]
+	// The source scheme is inherited deliberately: import tests derive endpoints
+	// from an httptest (http) userId and POST to it with the validator seam
+	// relaxed. In production the allow-list still rejects any non-https result.
 	scheme := u.Scheme
 	if scheme == "" {
 		scheme = "https"
@@ -650,8 +684,10 @@ func DeriveExternalIdpEndpoints(userId, clientID, accessToken string) (tokenEndp
 // endpoints are validated against the IdP host allow-list; redirects are NOT
 // followed (so a discovery host cannot bounce the fetch to an internal target);
 // and no response body is echoed into errors.
-func oidcDiscover(client *http.Client, issuerURL, proxyURL string) (authEndpoint, tokenEndpoint string, err error) {
-	if err = validateExternalIdpEndpoint(issuerURL); err != nil {
+func oidcDiscover(issuerURL, proxyURL string) (authEndpoint, tokenEndpoint string, err error) {
+	// Validate through the seam (like postExternalIdpToken) so tests can point
+	// discovery at an httptest server; in production it is the real allow-list.
+	if err = externalIdpEndpointValidator(issuerURL); err != nil {
 		return "", "", err
 	}
 	docURL := strings.TrimRight(strings.TrimSpace(issuerURL), "/") + "/.well-known/openid-configuration"
@@ -696,10 +732,10 @@ func oidcDiscover(client *http.Client, issuerURL, proxyURL string) (authEndpoint
 	// discovery doc legitimately points authorize/token at sibling hosts. If the
 	// allow-list is ever broadened to multiple distinct IdPs, tighten this to also
 	// pin the endpoints to the issuer's registrable host.
-	if err = validateExternalIdpEndpoint(doc.AuthorizationEndpoint); err != nil {
+	if err = externalIdpEndpointValidator(doc.AuthorizationEndpoint); err != nil {
 		return "", "", fmt.Errorf("discovered authorization_endpoint rejected: %w", err)
 	}
-	if err = validateExternalIdpEndpoint(doc.TokenEndpoint); err != nil {
+	if err = externalIdpEndpointValidator(doc.TokenEndpoint); err != nil {
 		return "", "", fmt.Errorf("discovered token_endpoint rejected: %w", err)
 	}
 	return doc.AuthorizationEndpoint, doc.TokenEndpoint, nil
@@ -772,7 +808,9 @@ func exchangeSocialCode(client *http.Client, code, codeVerifier string) (accessT
 	}
 	_ = json.Unmarshal(respBody, &out)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || out.AccessToken == "" {
-		return "", "", 0, "", fmt.Errorf("social token exchange failed (status %d): %s", resp.StatusCode, string(respBody))
+		// Deliberately omit the response body: it may carry tokens or upstream
+		// details that must not leak into logs / the admin UI.
+		return "", "", 0, "", fmt.Errorf("social token exchange failed (status %d)", resp.StatusCode)
 	}
 	return out.AccessToken, out.RefreshToken, out.ExpiresIn, out.ProfileArn, nil
 }
@@ -827,5 +865,20 @@ func removeKiroSsoSession(sessionID string) {
 	kiroSsoSessionsMu.Lock()
 	delete(kiroSsoSessions, sessionID)
 	kiroSsoSessionsMu.Unlock()
+}
+
+// hasActiveKiroSsoSession reports whether any registered session still holds the
+// loopback listener. Timed-out sessions linger in the registry for a grace window
+// (so a late poll reads the timeout), but their listener is closed, so they do not
+// count as active.
+func hasActiveKiroSsoSession() bool {
+	kiroSsoSessionsMu.RLock()
+	defer kiroSsoSessionsMu.RUnlock()
+	for _, s := range kiroSsoSessions {
+		if s.isActive() {
+			return true
+		}
+	}
+	return false
 }
 

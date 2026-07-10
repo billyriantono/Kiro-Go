@@ -467,8 +467,15 @@ func TestApiImportCredentialsExternalIdpDerivesFromAccessTokenJWT(t *testing.T) 
 	if got.AccessToken != jwt {
 		t.Fatalf("AccessToken: want the pasted JWT persisted verbatim (trust-on-import), got %q", got.AccessToken)
 	}
-	if got.ExpiresAt != exp {
-		t.Fatalf("ExpiresAt: want %d (from JWT exp, trust-on-import), got %d", exp, got.ExpiresAt)
+	// The JWT's exp is unverified, so the import clamps it to a 24h ceiling: it
+	// must be in the future (trust-on-import happened, no live refresh) but never
+	// beyond the clamp horizon (a crafted far-future exp must not stick).
+	now := time.Now().Unix()
+	if got.ExpiresAt <= now {
+		t.Fatalf("ExpiresAt: want a future timestamp (trust-on-import), got %d", got.ExpiresAt)
+	}
+	if maxExp := now + int64((24*time.Hour + time.Minute).Seconds()); got.ExpiresAt > maxExp {
+		t.Fatalf("ExpiresAt: want clamped to <=24h horizon (unverified JWT exp), got %d", got.ExpiresAt)
 	}
 	if got.RefreshToken != "rt" {
 		t.Fatalf("RefreshToken: want the pasted token (not rotated), got %q", got.RefreshToken)

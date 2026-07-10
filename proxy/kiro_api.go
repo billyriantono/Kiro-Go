@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +19,10 @@ import (
 const (
 	kiroRestAPIBase               = "https://codewhisperer.us-east-1.amazonaws.com"
 	profileArnUnsupportedCooldown = 24 * time.Hour
+	// profileArnProbeBudget caps the total wall time of one cross-region
+	// ListAvailableProfiles probe (all candidate regions, retries and backoff
+	// included) because it runs synchronously on the request path.
+	profileArnProbeBudget = 15 * time.Second
 )
 
 var profileArnResolutionCooldowns sync.Map
@@ -396,9 +401,15 @@ func ensureRestProfileArn(account *config.Account) error {
 // Builder ID "unsupported" 403 is authoritative across all regions, so it
 // short-circuits the probe rather than repeating per region.
 func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
+	// The probe runs synchronously on the request path (via ensureRestProfileArn),
+	// so bound the total wall time: worst case is candidates × attempts × network
+	// round-trips plus retry backoff, which must not hold a user request for long.
+	ctx, cancel := context.WithTimeout(context.Background(), profileArnProbeBudget)
+	defer cancel()
+
 	var lastErr error
 	for _, region := range kiroProfileRegionCandidates(account) {
-		arn, probeErr := listAvailableProfilesWithRetryInRegion(account, region)
+		arn, probeErr := listAvailableProfilesWithRetryInRegion(ctx, account, region)
 		if probeErr == nil && strings.TrimSpace(arn) != "" {
 			return arn, nil
 		}
@@ -406,6 +417,9 @@ func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
 			lastErr = probeErr
 			if isBuilderIDProfileUnsupportedError(account, probeErr) {
 				return "", probeErr
+			}
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("profile probe budget exhausted: %w", lastErr)
 			}
 		}
 	}
@@ -416,13 +430,13 @@ func resolveProfileArnAcrossRegions(account *config.Account) (string, error) {
 // specific region, retrying transient failures (network errors, 5xx, 429) with
 // short backoff. An empty profile list or 4xx (other than 429) is treated as
 // authoritative and not retried — they reflect account state, not upstream flakiness.
-func listAvailableProfilesWithRetryInRegion(account *config.Account, region string) (string, error) {
+func listAvailableProfilesWithRetryInRegion(ctx context.Context, account *config.Account, region string) (string, error) {
 	const maxAttempts = 3
 	backoff := 200 * time.Millisecond
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		profileArn, err := listAvailableProfilesInRegion(account, region)
+		profileArn, err := listAvailableProfilesInRegion(ctx, account, region)
 		if err == nil {
 			return profileArn, nil
 		}
@@ -432,7 +446,11 @@ func listAvailableProfilesWithRetryInRegion(account *config.Account, region stri
 		}
 		logger.Debugf("[ProfileArn] ListAvailableProfiles transient failure for %s in %s (attempt %d/%d): %v",
 			account.Email, region, attempt, maxAttempts, err)
-		time.Sleep(backoff)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(backoff):
+		}
 		backoff *= 2
 	}
 	return "", lastErr
@@ -461,9 +479,9 @@ func isTransientProfileFetchError(err error) bool {
 // REST host for us-east-1). Targeting an explicit region — rather than the account's
 // stored one — is what makes cross-region detection possible: the same credential is
 // probed against each candidate region until one returns a profile.
-func listAvailableProfilesInRegion(account *config.Account, region string) (string, error) {
+func listAvailableProfilesInRegion(ctx context.Context, account *config.Account, region string) (string, error) {
 	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
-	req, err := http.NewRequest("POST", endpoint, strings.NewReader(`{"maxResults":10}`))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
 		return "", err
 	}

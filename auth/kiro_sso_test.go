@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestKiroCallbackBindAddrs locks in the secure default (loopback-only) and the
@@ -295,6 +296,138 @@ func TestDeriveExternalIdpEndpoints(t *testing.T) {
 	// userId takes precedence over accessToken.
 	if te4, _, _ := DeriveExternalIdpEndpoints(userID, clientID, jwt); te4 != wantTE {
 		t.Fatalf("userId should take precedence over accessToken, got %q", te4)
+	}
+}
+
+// newTestKiroSsoSession builds a session for driving handleCallback directly,
+// without binding the loopback listener.
+func newTestKiroSsoSession() *KiroSsoSession {
+	return &KiroSsoSession{
+		ID:        "test-session",
+		Verifier:  generateCodeVerifier(),
+		State:     "portal-state",
+		Region:    "us-east-1",
+		ExpiresAt: time.Now().Add(time.Minute),
+		resultCh:  make(chan kiroSsoCapture, 1),
+	}
+}
+
+// TestEnterpriseLeg1RejectsMissingOrMismatchedState pins the anti-CSRF gate on
+// the enterprise descriptor: without it, any caller able to reach the listener
+// could inject a forged descriptor and pre-empt the single-shot leg-2.
+func TestEnterpriseLeg1RejectsMissingOrMismatchedState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"missing state", "login_option=external_idp&issuer_url=https://login.microsoftonline.com/t/v2.0&client_id=cid"},
+		{"mismatched state", "login_option=external_idp&issuer_url=https://login.microsoftonline.com/t/v2.0&client_id=cid&state=wrong"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestKiroSsoSession()
+			rec := httptest.NewRecorder()
+			s.handleCallback(rec, httptest.NewRequest(http.MethodGet, "/?"+tc.query, nil))
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+			}
+			s.mu.Lock()
+			leg2 := s.leg2
+			s.mu.Unlock()
+			if leg2 != nil {
+				t.Fatalf("forged descriptor must not start leg-2")
+			}
+			select {
+			case c := <-s.resultCh:
+				t.Fatalf("forged descriptor must not consume the one-shot capture, got %+v", c)
+			default:
+			}
+		})
+	}
+}
+
+// TestEnterpriseTwoLegFlow drives the full enterprise state machine through
+// handleCallback: portal descriptor (leg-1, state-matched) -> 302 to the IdP
+// authorize URL -> IdP code redirect (leg-2, state2-matched) -> capture with the
+// discovered token endpoint and the leg-2 PKCE verifier.
+func TestEnterpriseTwoLegFlow(t *testing.T) {
+	var disc *httptest.Server
+	disc = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"authorization_endpoint":"` + disc.URL + `/authorize","token_endpoint":"` + disc.URL + `/token"}`))
+	}))
+	defer disc.Close()
+
+	// The discovery issuer/endpoints are httptest URLs (http + 127.0.0.1) the real
+	// allow-list rejects; relax it through the seam like the refresh tests do.
+	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer SetExternalIdpValidatorForTest(restore)
+
+	s := newTestKiroSsoSession()
+
+	// Leg-1: portal descriptor with the matching portal state.
+	q := url.Values{}
+	q.Set("login_option", "external_idp")
+	q.Set("issuer_url", disc.URL)
+	q.Set("client_id", "cid-123")
+	q.Set("scopes", "api://cid-123/codewhisperer:conversations offline_access")
+	q.Set("state", s.State)
+	rec := httptest.NewRecorder()
+	s.handleCallback(rec, httptest.NewRequest(http.MethodGet, "/?"+q.Encode(), nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("leg-1 status = %d, want 302 (body: %s)", rec.Code, rec.Body.String())
+	}
+	authURL, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse authorize redirect: %v", err)
+	}
+	state2 := authURL.Query().Get("state")
+	if state2 == "" || state2 == s.State {
+		t.Fatalf("leg-2 must use a fresh state, got %q", state2)
+	}
+	if got := authURL.Query().Get("client_id"); got != "cid-123" {
+		t.Fatalf("authorize client_id = %q", got)
+	}
+
+	// A second descriptor must not reset the in-flight leg-2 (single-shot).
+	rec2 := httptest.NewRecorder()
+	s.handleCallback(rec2, httptest.NewRequest(http.MethodGet, "/?"+q.Encode(), nil))
+	if rec2.Code != http.StatusNoContent {
+		t.Fatalf("second descriptor status = %d, want 204", rec2.Code)
+	}
+
+	// Leg-2: a code with the wrong state is ignored...
+	rec3 := httptest.NewRecorder()
+	s.handleCallback(rec3, httptest.NewRequest(http.MethodGet, kiroOAuthCallbackPath+"?code=abc&state=wrong", nil))
+	if rec3.Code != http.StatusNoContent {
+		t.Fatalf("wrong-state leg-2 status = %d, want 204", rec3.Code)
+	}
+
+	// ...and the matching state delivers the capture.
+	rec4 := httptest.NewRecorder()
+	s.handleCallback(rec4, httptest.NewRequest(http.MethodGet, kiroOAuthCallbackPath+"?code=auth-code&state="+state2, nil))
+	if rec4.Code != http.StatusOK {
+		t.Fatalf("leg-2 status = %d, want 200", rec4.Code)
+	}
+	select {
+	case capture := <-s.resultCh:
+		if capture.err != nil {
+			t.Fatalf("capture error: %v", capture.err)
+		}
+		if capture.kind != "external_idp" || capture.code != "auth-code" {
+			t.Fatalf("capture = %+v", capture)
+		}
+		if capture.tokenEndpoint != disc.URL+"/token" {
+			t.Fatalf("capture tokenEndpoint = %q, want %q", capture.tokenEndpoint, disc.URL+"/token")
+		}
+		if capture.clientID != "cid-123" || capture.codeVerifier == "" {
+			t.Fatalf("capture missing leg-2 context: %+v", capture)
+		}
+	default:
+		t.Fatalf("expected a delivered capture after leg-2")
 	}
 }
 

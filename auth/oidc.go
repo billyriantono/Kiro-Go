@@ -122,7 +122,9 @@ func postExternalIdpToken(client *http.Client, tokenEndpoint string, form url.Va
 		if out.Error != "" {
 			return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d): %s: %s", resp.StatusCode, out.Error, out.ErrorDesc)
 		}
-		return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d): %s", resp.StatusCode, string(body))
+		// Non-OAuth error body: deliberately not echoed — it may carry tokens or
+		// upstream details that must not leak into logs / the admin UI.
+		return "", "", 0, fmt.Errorf("external IdP token exchange failed (status %d)", resp.StatusCode)
 	}
 	return out.AccessToken, out.RefreshToken, out.ExpiresIn, nil
 }
@@ -170,6 +172,12 @@ func refreshOIDCToken(refreshToken, clientID, clientSecret, region string, clien
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", "", 0, "", err
 	}
+	// A 200 with no access token (e.g. an empty JSON object) must be an error, not
+	// a "successful" refresh that hands callers an empty bearer. Mirrors the guard
+	// in postExternalIdpToken.
+	if result.AccessToken == "" {
+		return "", "", 0, "", fmt.Errorf("refresh succeeded (status 200) but response carried no access token")
+	}
 
 	expiresAt := time.Now().Unix() + int64(result.ExpiresIn)
 	return result.AccessToken, result.RefreshToken, expiresAt, result.ProfileArn, nil
@@ -207,6 +215,9 @@ func refreshSocialToken(refreshToken string, client *http.Client) (string, strin
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", "", 0, "", err
+	}
+	if result.AccessToken == "" {
+		return "", "", 0, "", fmt.Errorf("refresh succeeded (status 200) but response carried no access token")
 	}
 
 	expiresAt := time.Now().Unix() + int64(result.ExpiresIn)
