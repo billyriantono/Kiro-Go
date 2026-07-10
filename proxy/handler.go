@@ -2217,6 +2217,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiPollKiroSso(w, r)
 	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
 		h.apiCancelKiroSso(w, r)
+	case path == "/auth/kiro-sso/relay" && r.Method == "POST":
+		h.apiRelayKiroSso(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
@@ -2851,6 +2853,45 @@ func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
 		auth.CancelKiroSsoLogin(req.SessionID)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// apiRelayKiroSso accepts a redirect URL the operator pasted from a browser on a
+// DIFFERENT machine than the proxy (where the localhost:3128 redirects cannot land)
+// and feeds it through the active session's callback state machine. Both legs go
+// through here: the enterprise leg-1 descriptor returns the IdP authorize URL the
+// operator's browser must open next; the leg-2 code (or the social code) completes
+// the capture and the regular poll picks it up. All anti-CSRF state checks apply
+// unchanged, and the endpoint sits behind the admin-password gate.
+func (h *Handler) apiRelayKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+		URL       string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.SessionID == "" || strings.TrimSpace(req.URL) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and url are required"})
+		return
+	}
+
+	authorizeURL, done, err := auth.RelayKiroSsoCallback(req.SessionID, req.URL)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"done":         done,
+		"authorizeUrl": authorizeURL,
+	})
 }
 
 // apiPollKiroSso reports the hosted-portal sign-in status. While the user is signing in it

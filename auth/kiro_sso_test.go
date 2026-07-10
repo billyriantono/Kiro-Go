@@ -431,6 +431,66 @@ func TestEnterpriseTwoLegFlow(t *testing.T) {
 	}
 }
 
+// TestRelayKiroSsoCallback drives the remote-browser path: the operator pastes
+// the failed localhost redirect URLs into the admin panel and they are fed
+// through the same state machine — leg-1 returns the IdP authorize URL, leg-2
+// completes the capture, and a wrong-state URL is rejected.
+func TestRelayKiroSsoCallback(t *testing.T) {
+	var disc *httptest.Server
+	disc = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"authorization_endpoint":"` + disc.URL + `/authorize","token_endpoint":"` + disc.URL + `/token"}`))
+	}))
+	defer disc.Close()
+	restore := SetExternalIdpValidatorForTest(func(string) error { return nil })
+	defer SetExternalIdpValidatorForTest(restore)
+
+	s := newTestKiroSsoSession()
+	kiroSsoSessionsMu.Lock()
+	kiroSsoSessions[s.ID] = s
+	kiroSsoSessionsMu.Unlock()
+	defer removeKiroSsoSession(s.ID)
+
+	if _, _, err := RelayKiroSsoCallback("no-such-session", "http://localhost:3128/?code=x"); err == nil {
+		t.Fatalf("unknown session must be rejected")
+	}
+	if _, _, err := RelayKiroSsoCallback(s.ID, "http://localhost:3128/"); err == nil {
+		t.Fatalf("URL without query parameters must be rejected")
+	}
+
+	// Leg-1 descriptor with a mismatched state must not start leg-2.
+	if _, _, err := RelayKiroSsoCallback(s.ID,
+		"http://localhost:3128/?login_option=external_idp&issuer_url="+url.QueryEscape(disc.URL)+"&client_id=cid&state=wrong"); err == nil {
+		t.Fatalf("mismatched-state descriptor must be rejected")
+	}
+
+	// Leg-1 descriptor with the portal state returns the IdP authorize URL.
+	authorizeURL, done, err := RelayKiroSsoCallback(s.ID,
+		"http://localhost:3128/?login_option=external_idp&issuer_url="+url.QueryEscape(disc.URL)+"&client_id=cid&state="+s.State)
+	if err != nil || done || authorizeURL == "" {
+		t.Fatalf("leg-1 relay: url=%q done=%v err=%v", authorizeURL, done, err)
+	}
+	parsed, err := url.Parse(authorizeURL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	state2 := parsed.Query().Get("state")
+
+	// Leg-2 code redirect completes the capture (poll picks the outcome up).
+	_, done, err = RelayKiroSsoCallback(s.ID, "http://localhost:3128"+kiroOAuthCallbackPath+"?code=auth-code&state="+state2)
+	if err != nil || !done {
+		t.Fatalf("leg-2 relay: done=%v err=%v", done, err)
+	}
+	select {
+	case capture := <-s.resultCh:
+		if capture.err != nil || capture.kind != "external_idp" || capture.code != "auth-code" {
+			t.Fatalf("capture = %+v", capture)
+		}
+	default:
+		t.Fatalf("expected a delivered capture after leg-2 relay")
+	}
+}
+
 // TestExpFromAccessTokenJWT pins the exp extraction used for trust-on-import.
 func TestExpFromAccessTokenJWT(t *testing.T) {
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"x","exp":2000000000}`))

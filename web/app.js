@@ -2487,6 +2487,11 @@
       '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
       '</div>' +
       '</div>' +
+      '<div class="form-group mt-3"><label>' + escapeHtml(t('kirosso.relayLabel')) + '</label>' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.relayNote')) + '</p></div>' +
+      '<input id="kiroSsoRelayUrl" type="text" class="font-mono text-xs" placeholder="http://localhost:3128/...">' +
+      '<button class="btn btn-sm btn-outline mt-2" id="kiroSsoRelayBtn" type="button">' + escapeHtml(t('kirosso.relaySubmit')) + '</button>' +
+      '</div>' +
       '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>';
@@ -2509,10 +2514,33 @@
         toast(t('common.copied'), 'primary');
       });
       $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
+      $('kiroSsoRelayBtn').addEventListener('click', relayKiroSsoUrl);
       // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
       window.open(d.signInUrl, '_blank');
       pollKiroSso(d.interval || 2);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  // Remote-browser relay: when the browser runs on a different machine than the
+  // proxy, the localhost:3128 redirects fail to connect there — but the full URL
+  // survives in the address bar. The operator pastes it here and the backend feeds
+  // it through the same callback state machine (state checks included). The
+  // enterprise flow needs this twice: the portal descriptor (which returns the IdP
+  // authorize URL to open next) and the final code redirect.
+  async function relayKiroSsoUrl() {
+    const raw = $('kiroSsoRelayUrl').value.trim();
+    if (!raw || !kiroSsoSession) return;
+    const res = await api('/auth/kiro-sso/relay', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession, url: raw }) });
+    const d = await res.json();
+    if (d.success && d.authorizeUrl) {
+      $('kiroSsoRelayUrl').value = '';
+      window.open(d.authorizeUrl, '_blank');
+      toast(t('kirosso.relayContinue'), 'primary');
+    } else if (d.success && d.done) {
+      $('kiroSsoRelayUrl').value = '';
+      $('kiroSsoStatus').textContent = t('builderid.waiting');
+    } else {
+      toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
   }
   function pollKiroSso(interval) {
     kiroSsoPollTimer = setTimeout(async () => {

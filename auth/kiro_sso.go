@@ -373,6 +373,71 @@ func (s *KiroSsoSession) close() {
 	})
 }
 
+// relayResponseWriter is a minimal in-memory http.ResponseWriter used to feed a
+// pasted redirect URL through handleCallback without a live HTTP connection.
+type relayResponseWriter struct {
+	header http.Header
+	status int
+}
+
+func newRelayResponseWriter() *relayResponseWriter {
+	return &relayResponseWriter{header: make(http.Header), status: http.StatusOK}
+}
+
+func (w *relayResponseWriter) Header() http.Header       { return w.header }
+func (w *relayResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (w *relayResponseWriter) WriteHeader(status int)    { w.status = status }
+
+// RelayKiroSsoCallback feeds a redirect URL the operator pasted into the admin
+// panel through the session's callback state machine. This is the remote-browser
+// path: when the browser runs on a DIFFERENT machine than the proxy, the portal /
+// IdP redirects to localhost:3128 fail to connect there, but the full redirect URL
+// (descriptor or code+state) survives in the address bar; the operator pastes it
+// here and it is processed exactly as if the loopback listener had received it —
+// including the anti-CSRF state checks on both legs.
+//
+// Returns (authorizeURL, false, nil) when the pasted URL was the enterprise leg-1
+// descriptor: the operator's browser must then open authorizeURL (the IdP login
+// page) and the operator pastes the NEXT failed redirect too. Returns ("", true,
+// nil) when the code was captured (poll picks the outcome up). A URL that matches
+// nothing (state mismatch, already processed, missing params) is an error.
+func RelayKiroSsoCallback(sessionID, rawURL string) (authorizeURL string, done bool, err error) {
+	kiroSsoSessionsMu.RLock()
+	session, ok := kiroSsoSessions[sessionID]
+	kiroSsoSessionsMu.RUnlock()
+	if !ok {
+		return "", false, fmt.Errorf("session not found or expired")
+	}
+
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", false, fmt.Errorf("invalid callback URL: %w", err)
+	}
+	if u.RawQuery == "" {
+		return "", false, fmt.Errorf("callback URL carries no query parameters — paste the full URL from the browser address bar")
+	}
+
+	// Rebuild the request the loopback listener would have seen: same path and
+	// query, host/scheme irrelevant (handleCallback never reads them).
+	req, err := http.NewRequest(http.MethodGet, "http://localhost:"+kiroRedirectPort+u.Path+"?"+u.RawQuery, nil)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to reconstruct callback request: %w", err)
+	}
+	w := newRelayResponseWriter()
+	session.handleCallback(w, req)
+
+	switch w.status {
+	case http.StatusFound:
+		return w.header.Get("Location"), false, nil
+	case http.StatusOK:
+		// Terminal: a capture (code or error) was delivered; PollKiroSsoAuth
+		// surfaces the outcome.
+		return "", true, nil
+	default:
+		return "", false, fmt.Errorf("callback URL did not match the active login (wrong state, already processed, or missing parameters)")
+	}
+}
+
 // CancelKiroSsoLogin tears an in-flight session down immediately (operator
 // cancelled in the admin panel), freeing the loopback port without waiting for the
 // deadline. A no-op for an unknown or already-finished session.
