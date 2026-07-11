@@ -51,7 +51,9 @@ func NewRelayTransportWith(inner http.RoundTripper, relayURL, secret string) htt
 }
 
 func (rt *relayTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	relayURL, secret := config.GetRelaySettings()
+	// ActiveRelay returns a URL only when the relay is the SELECTED outbound mode;
+	// a stored-but-unselected relay stays dormant (passthrough below).
+	relayURL, secret := config.ActiveRelay()
 	if rt.fixed {
 		relayURL, secret = rt.fixedURL, rt.fixedSecret
 	}

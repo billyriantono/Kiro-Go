@@ -142,3 +142,50 @@ func TestInitSQLitePersistsUpdates(t *testing.T) {
 		t.Fatalf("added account not persisted to DB: %+v", accs)
 	}
 }
+
+// TestRelayGating verifies the relay only activates when selected as the outbound
+// mode: a stored URL alone leaves ActiveRelay empty until SetRelayEnabled(true),
+// and enabling the relay clears any socks/http proxy (mutually exclusive).
+func TestRelayGating(t *testing.T) {
+	resetGlobals(t)
+	defer resetGlobals(t)
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Configure a relay URL/secret but leave the mode unselected.
+	if err := UpdateRelaySettings("https://r.example.workers.dev", "sekret"); err != nil {
+		t.Fatalf("UpdateRelaySettings: %v", err)
+	}
+	if u, _ := ActiveRelay(); u != "" {
+		t.Fatalf("relay must stay dormant until selected, got active %q", u)
+	}
+	if IsRelayEnabled() {
+		t.Fatal("relay should not be enabled yet")
+	}
+
+	// Set a proxy, then enable the relay — enabling must clear the proxy.
+	if err := UpdateProxySettings("socks5://127.0.0.1:1080"); err != nil {
+		t.Fatalf("UpdateProxySettings: %v", err)
+	}
+	if err := SetRelayEnabled(true); err != nil {
+		t.Fatalf("SetRelayEnabled: %v", err)
+	}
+	if u, s := ActiveRelay(); u != "https://r.example.workers.dev" || s != "sekret" {
+		t.Fatalf("active relay = %q/%q", u, s)
+	}
+	if GetProxyURL() != "" {
+		t.Fatalf("enabling relay must clear the proxy URL, got %q", GetProxyURL())
+	}
+
+	// Deselecting the relay makes it dormant again while keeping its stored config.
+	if err := SetRelayEnabled(false); err != nil {
+		t.Fatalf("SetRelayEnabled(false): %v", err)
+	}
+	if u, _ := ActiveRelay(); u != "" {
+		t.Fatalf("relay should be dormant after deselect, got %q", u)
+	}
+	if url, _ := GetRelaySettings(); url != "https://r.example.workers.dev" {
+		t.Fatalf("stored relay URL must be retained, got %q", url)
+	}
+}

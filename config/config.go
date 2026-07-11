@@ -189,12 +189,16 @@ type Config struct {
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
 
-	// Egress relay: an alternative to ProxyURL. When RelayURL is set, upstream
-	// requests are routed through a serverless forwarder (Cloudflare Workers /
-	// Vercel / Deno) so AWS sees the relay's IP. RelaySecret is the shared secret
-	// the relay validates (X-Relay-Key). See package egress and relay/.
-	RelayURL    string `json:"relayURL,omitempty"`
-	RelaySecret string `json:"relaySecret,omitempty"`
+	// Egress relay: an alternative to ProxyURL. The relay only routes traffic when
+	// RelayEnabled is true (the operator selects "Egress Relay" as the outbound
+	// mode) — a stored RelayURL alone does NOT activate it, so URL/secret can be
+	// configured while the outbound stays Direct/proxy. When active, upstream
+	// requests go through a serverless forwarder (Cloudflare/Vercel/Deno) so AWS
+	// sees the relay's IP. RelaySecret is the shared secret (X-Relay-Key). See
+	// package egress and relay/.
+	RelayEnabled bool   `json:"relayEnabled,omitempty"`
+	RelayURL     string `json:"relayURL,omitempty"`
+	RelaySecret  string `json:"relaySecret,omitempty"`
 
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
@@ -941,8 +945,9 @@ func UpdateProxySettings(proxyURL string) error {
 	return Save()
 }
 
-// GetRelaySettings returns the egress relay URL and shared secret. An empty URL
-// means no relay is configured (direct / ProxyURL egress).
+// GetRelaySettings returns the stored egress relay URL and shared secret,
+// regardless of whether the relay is currently the active outbound mode. Used by
+// the admin config/test/source flows.
 func GetRelaySettings() (string, string) {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -952,13 +957,46 @@ func GetRelaySettings() (string, string) {
 	return cfg.RelayURL, cfg.RelaySecret
 }
 
+// IsRelayEnabled reports whether the egress relay is the selected outbound mode.
+func IsRelayEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg != nil && cfg.RelayEnabled
+}
+
+// ActiveRelay returns the relay URL + secret ONLY when the relay is the active
+// outbound mode and a URL is configured; otherwise ("", ""). The egress transport
+// uses this so a stored-but-unselected relay stays dormant.
+func ActiveRelay() (string, string) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || !cfg.RelayEnabled || cfg.RelayURL == "" {
+		return "", ""
+	}
+	return cfg.RelayURL, cfg.RelaySecret
+}
+
 // UpdateRelaySettings sets the egress relay URL and shared secret and persists
-// them. An empty relayURL disables the relay.
+// them. It does NOT change the enabled state (activation is via the outbound mode
+// selector) — configuring a relay while another outbound mode is active is fine.
 func UpdateRelaySettings(relayURL, relaySecret string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.RelayURL = relayURL
 	cfg.RelaySecret = relaySecret
+	return Save()
+}
+
+// SetRelayEnabled selects (or deselects) the egress relay as the outbound mode.
+// Enabling the relay clears any socks5/http ProxyURL since the two are mutually
+// exclusive outbound modes.
+func SetRelayEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.RelayEnabled = enabled
+	if enabled {
+		cfg.ProxyURL = ""
+	}
 	return Save()
 }
 

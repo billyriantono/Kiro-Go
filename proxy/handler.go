@@ -3905,17 +3905,23 @@ func applyProxyConfig(proxyURL string) {
 	auth.InitHttpClient(proxyURL)
 }
 
-// apiGetProxy 获取当前代理配置
+// apiGetProxy returns the outbound mode: the socks5/http proxy URL and whether
+// the egress relay is the selected mode. The two are mutually exclusive.
 func (h *Handler) apiGetProxy(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"proxyURL": config.GetProxyURL(),
+		"useRelay": config.IsRelayEnabled(),
 	})
 }
 
-// apiUpdateProxy 更新代理配置并立即生效
+// apiUpdateProxy sets the outbound egress mode. useRelay=true selects the egress
+// relay (and clears any socks5/http proxy); otherwise the proxyURL (possibly
+// empty = Direct) is used and the relay is deselected. Relay and proxy are
+// mutually exclusive outbound modes.
 func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProxyURL string `json:"proxyURL"`
+		UseRelay bool   `json:"useRelay"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3923,7 +3929,26 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 验证代理 URL 格式（非空时）
+	if req.UseRelay {
+		// Selecting the relay: require a configured relay URL, enable it (which
+		// clears the proxy URL), and reset the HTTP clients to direct dialing — the
+		// relay RoundTripper wraps every client and takes over once active.
+		if relayURL, _ := config.GetRelaySettings(); strings.TrimSpace(relayURL) == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "configure a Relay URL in the Egress Relay section first"})
+			return
+		}
+		if err := config.SetRelayEnabled(true); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		applyProxyConfig("")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		return
+	}
+
+	// Non-relay mode: validate the proxy URL (empty = Direct).
 	if req.ProxyURL != "" {
 		if !strings.HasPrefix(req.ProxyURL, "http://") &&
 			!strings.HasPrefix(req.ProxyURL, "https://") &&
@@ -3934,16 +3959,17 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
+	if err := config.SetRelayEnabled(false); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-
-	// 立即应用新的代理配置
 	applyProxyConfig(req.ProxyURL)
-
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 

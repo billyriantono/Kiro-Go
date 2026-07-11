@@ -1477,7 +1477,7 @@
     const acc = getTestAccount(testModalAccountId);
     const idAttr = escapeAttr(testModalAccountId);
     const email = acc ? getDisplayEmail(acc.email, acc.id) : testModalAccountId;
-    const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
+    const proxy = acc ? (acc.proxyURL || (relayActive ? t('accounts.testLog.relay') : t('accounts.testLog.globalProxy'))) : '?';
     const statusText = testModalLoadingModels
       ? t('accounts.testModelsLoading')
       : testModalModelError
@@ -1554,7 +1554,7 @@
     if (modalBtn) modalBtn.setAttribute('aria-busy', 'true');
     const acc = accountsData.find(a => a.id === id);
     const email = acc ? getDisplayEmail(acc.email, acc.id) : id;
-    const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
+    const proxy = acc ? (acc.proxyURL || (relayActive ? t('accounts.testLog.relay') : t('accounts.testLog.globalProxy'))) : '?';
     addTestLog(t('accounts.testLog.start', email, model, proxy), 'info');
     try {
       const startTime = Date.now();
@@ -1618,13 +1618,22 @@
     if (d.success) toast(t('settings.endpointSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
+  // relayActive mirrors the server's outbound mode so the test log can label the
+  // egress correctly (Egress Relay vs Global Proxy).
+  let relayActive = false;
   async function loadProxyConfig() {
     const res = await api('/proxy');
     const d = await res.json();
+    relayActive = !!d.useRelay;
+    if (relayActive) {
+      $('proxyType').value = 'relay';
+      onProxyTypeChange();
+      return;
+    }
     const url = d.proxyURL || '';
     if (!url) {
       $('proxyType').value = 'none';
-      $('proxyFields').classList.add('hidden');
+      onProxyTypeChange();
       return;
     }
     try {
@@ -1635,18 +1644,30 @@
       $('proxyPort').value = u.port;
       $('proxyUsername').value = decodeURIComponent(u.username);
       $('proxyPassword').value = decodeURIComponent(u.password);
-      $('proxyFields').classList.remove('hidden');
+      onProxyTypeChange();
     } catch (e) {
       $('proxyType').value = 'none';
-      $('proxyFields').classList.add('hidden');
+      onProxyTypeChange();
     }
   }
   function onProxyTypeChange() {
     const type = $('proxyType').value;
-    $('proxyFields').classList.toggle('hidden', type === 'none');
+    // Proxy host/port fields apply only to socks5/http; the relay is configured in
+    // its own section below.
+    $('proxyFields').classList.toggle('hidden', type === 'none' || type === 'relay');
+    const hint = $('proxyRelayHint');
+    if (hint) hint.classList.toggle('hidden', type !== 'relay');
   }
   async function saveProxyConfig() {
     const type = $('proxyType').value;
+    if (type === 'relay') {
+      if (!$('relayUrl').value.trim()) { toast(t('relay.needUrl'), 'warning'); return; }
+      const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ useRelay: true }) });
+      const d = await res.json();
+      if (d.success) { relayActive = true; toast(t('settings.proxySaved'), 'success'); }
+      else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+      return;
+    }
     let url = '';
     if (type !== 'none') {
       const host = $('proxyHost').value.trim();
@@ -1657,9 +1678,9 @@
       const auth = u ? (p ? encodeURIComponent(u) + ':' + encodeURIComponent(p) + '@' : encodeURIComponent(u) + '@') : '';
       url = type + '://' + auth + host + ':' + port;
     }
-    const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ proxyURL: url }) });
+    const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ proxyURL: url, useRelay: false }) });
     const d = await res.json();
-    if (d.success) toast(t('settings.proxySaved'), 'success');
+    if (d.success) { relayActive = false; toast(t('settings.proxySaved'), 'success'); }
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   // --- Egress relay (Cloudflare / Vercel / Deno) ---
