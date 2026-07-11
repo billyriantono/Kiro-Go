@@ -389,6 +389,49 @@
           <button class="btn btn-primary" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
         </div>
 
+        <!-- Egress relay (Cloudflare / Vercel / Deno) -->
+        <div class="card">
+          <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:1rem">
+            <span class="card-title" data-i18n="relay.settings"></span>
+            <div class="relay-deploy-wrap" style="position:relative">
+              <button class="btn btn-sm btn-outline" id="deployRelayBtn" type="button">
+                <i class="fa-solid fa-rocket"></i>
+                <span data-i18n="relay.deploy"></span>
+                <i class="fa-solid fa-chevron-up" style="margin-left:.25rem"></i>
+              </button>
+              <div id="deployRelayMenu" class="relay-deploy-menu hidden"
+                style="position:absolute;right:0;top:calc(100% + .4rem);z-index:20;min-width:220px;background:var(--card-bg,#1b1b1f);border:1px solid var(--border,#333);border-radius:.6rem;padding:.4rem;box-shadow:0 10px 30px rgba(0,0,0,.4)">
+                <button class="relay-deploy-item" data-relay-platform="cloudflare" type="button"
+                  style="display:flex;align-items:center;gap:.6rem;width:100%;padding:.6rem .7rem;background:none;border:none;color:inherit;border-radius:.4rem;cursor:pointer;text-align:left">
+                  <i class="fa-brands fa-cloudflare" style="color:#f38020"></i><span data-i18n="relay.cloudflare"></span>
+                </button>
+                <button class="relay-deploy-item" data-relay-platform="vercel" type="button"
+                  style="display:flex;align-items:center;gap:.6rem;width:100%;padding:.6rem .7rem;background:none;border:none;color:inherit;border-radius:.4rem;cursor:pointer;text-align:left">
+                  <i class="fa-solid fa-triangle" style="color:#5b8def"></i><span data-i18n="relay.vercel"></span>
+                </button>
+                <button class="relay-deploy-item" data-relay-platform="deno" type="button"
+                  style="display:flex;align-items:center;gap:.6rem;width:100%;padding:.6rem .7rem;background:none;border:none;color:inherit;border-radius:.4rem;cursor:pointer;text-align:left">
+                  <i class="fa-solid fa-terminal" style="color:#70e000"></i><span data-i18n="relay.deno"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+          <p class="help-block" data-i18n="relay.desc"></p>
+          <div class="form-group">
+            <label data-i18n="relay.url"></label>
+            <input type="text" id="relayUrl" placeholder="https://your-worker.workers.dev" autocomplete="off" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="relay.secret"></label>
+            <input type="password" id="relaySecret" data-i18n-placeholder="relay.secretPlaceholder" autocomplete="new-password" />
+            <p class="help-block text-xs" id="relaySecretHint"></p>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-primary" id="saveRelayBtn" type="button" data-i18n="relay.save"></button>
+            <button class="btn btn-outline" id="testRelayBtn" type="button" data-i18n="relay.test"></button>
+          </div>
+        </div>
+
         <!-- Prompt filter -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.promptFilter"></span></div>

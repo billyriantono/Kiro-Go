@@ -23,6 +23,8 @@ func settingsFrom(c *Config) map[string]string {
 		"claude_thinking_format":  c.ClaudeThinkingFormat,
 		"preferred_endpoint":      c.PreferredEndpoint,
 		"proxy_url":               c.ProxyURL,
+		"relay_url":               c.RelayURL,
+		"relay_secret":            c.RelaySecret,
 		"log_level":               c.LogLevel,
 		"allow_over_usage":        boolStr(c.AllowOverUsage),
 		"filter_claude_code":      boolStr(c.FilterClaudeCode),
@@ -56,6 +58,8 @@ func applySettings(c *Config, m map[string]string) {
 	c.ClaudeThinkingFormat = m["claude_thinking_format"]
 	c.PreferredEndpoint = m["preferred_endpoint"]
 	c.ProxyURL = m["proxy_url"]
+	c.RelayURL = m["relay_url"]
+	c.RelaySecret = m["relay_secret"]
 	c.LogLevel = m["log_level"]
 	c.AllowOverUsage = m["allow_over_usage"] == "1"
 	c.FilterClaudeCode = m["filter_claude_code"] == "1"

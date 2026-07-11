@@ -1579,7 +1579,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadRelayConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1661,6 +1661,83 @@
     const d = await res.json();
     if (d.success) toast(t('settings.proxySaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  // --- Egress relay (Cloudflare / Vercel / Deno) ---
+  async function loadRelayConfig() {
+    try {
+      const res = await api('/relay');
+      const d = await res.json();
+      $('relayUrl').value = d.relayUrl || '';
+      // Never round-trip the secret to the client; show a hint if one is stored.
+      $('relaySecret').value = '';
+      $('relaySecretHint').textContent = d.hasSecret ? t('relay.secretStored') : '';
+    } catch (e) { }
+  }
+  async function saveRelayConfig() {
+    const relayUrl = $('relayUrl').value.trim();
+    const relaySecret = $('relaySecret').value;
+    const res = await api('/relay', { method: 'POST', body: JSON.stringify({ relayUrl, relaySecret }) });
+    const d = await res.json();
+    if (d.success) { toast(t('relay.saved'), 'success'); loadRelayConfig(); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function testRelayConfig() {
+    const relayUrl = $('relayUrl').value.trim();
+    const relaySecret = $('relaySecret').value;
+    if (!relayUrl) { toast(t('relay.needUrl'), 'warning'); return; }
+    toast(t('relay.testing'), 'primary');
+    try {
+      const res = await api('/relay/test', { method: 'POST', body: JSON.stringify({ relayUrl, relaySecret }) });
+      const d = await res.json();
+      if (d.ok) toast(t('relay.testOk') + ' (HTTP ' + d.status + ')', 'success');
+      else toast(t('relay.testFail') + ': ' + (d.error || ('HTTP ' + d.status + ' ' + (d.detail || ''))), 'error');
+    } catch (e) {
+      toast(t('relay.testFail') + ': ' + e, 'error');
+    }
+  }
+  function toggleDeployRelayMenu(show) {
+    const menu = $('deployRelayMenu');
+    if (!menu) return;
+    if (show === undefined) menu.classList.toggle('hidden');
+    else menu.classList.toggle('hidden', !show);
+  }
+  // openInfoModal reuses the shared addModal shell for read-only content. bodyHtml
+  // is composed only from escaped values + trusted i18n strings (same pattern as
+  // the other modalXxx builders); the relay code itself is injected via textContent.
+  function openInfoModal(titleText, bodyHtml) {
+    $('modalTitle').textContent = titleText;
+    $('modalBody').innerHTML = bodyHtml;
+    if (!$('addModal').classList.contains('active')) openDialog('addModal');
+  }
+  async function showRelaySource(platform) {
+    toggleDeployRelayMenu(false);
+    try {
+      const res = await api('/relay/source?platform=' + encodeURIComponent(platform));
+      const d = await res.json();
+      if (d.error) { toast(d.error, 'error'); return; }
+      // The server baked (and persisted) the shared secret into the code, so the
+      // operator never touches a platform env var. Reflect it in the form.
+      if (d.secret) {
+        $('relaySecret').value = d.secret;
+        $('relaySecretHint').textContent = t('relay.secretBaked');
+      }
+      const steps = t('relay.steps.' + platform);
+      const body =
+        '<p class="help-block">' + escapeHtml(steps) + '</p>' +
+        '<div class="flex justify-between items-center mb-2">' +
+        '<span class="font-mono text-xs">' + escapeHtml(d.filename) + '</span>' +
+        '<button class="btn btn-sm btn-outline" id="relayCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+        '</div>' +
+        '<pre style="max-height:50vh;overflow:auto;background:var(--code-bg,#0e0e12);padding:1rem;border-radius:.5rem"><code class="text-xs" id="relaySrcCode"></code></pre>';
+      openInfoModal(t('relay.deploy') + ' — ' + t('relay.' + platform), body);
+      $('relaySrcCode').textContent = d.code;
+      $('relayCopyBtn').addEventListener('click', async () => {
+        await copyText(d.code);
+        toast(t('common.copied'), 'primary');
+      });
+    } catch (e) {
+      toast(String(e), 'error');
+    }
   }
   async function saveRequireApiKey() {
     try {
@@ -3005,8 +3082,24 @@
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
+    bindRelayEvents();
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
+  }
+
+  function bindRelayEvents() {
+    const saveBtn = $('saveRelayBtn');
+    if (!saveBtn) return;
+    saveBtn.addEventListener('click', saveRelayConfig);
+    $('testRelayBtn').addEventListener('click', testRelayConfig);
+    $('deployRelayBtn').addEventListener('click', (e) => { e.stopPropagation(); toggleDeployRelayMenu(); });
+    document.querySelectorAll('.relay-deploy-item').forEach(btn => {
+      btn.addEventListener('click', () => showRelaySource(btn.dataset.relayPlatform));
+    });
+    // Close the deploy menu when clicking elsewhere.
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.relay-deploy-wrap')) toggleDeployRelayMenu(false);
+    });
   }
 
   function bindPromptFilterEvents() {

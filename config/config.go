@@ -189,6 +189,13 @@ type Config struct {
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// Egress relay: an alternative to ProxyURL. When RelayURL is set, upstream
+	// requests are routed through a serverless forwarder (Cloudflare Workers /
+	// Vercel / Deno) so AWS sees the relay's IP. RelaySecret is the shared secret
+	// the relay validates (X-Relay-Key). See package egress and relay/.
+	RelayURL    string `json:"relayURL,omitempty"`
+	RelaySecret string `json:"relaySecret,omitempty"`
+
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
 	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
@@ -931,6 +938,27 @@ func UpdateProxySettings(proxyURL string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	return Save()
+}
+
+// GetRelaySettings returns the egress relay URL and shared secret. An empty URL
+// means no relay is configured (direct / ProxyURL egress).
+func GetRelaySettings() (string, string) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return "", ""
+	}
+	return cfg.RelayURL, cfg.RelaySecret
+}
+
+// UpdateRelaySettings sets the egress relay URL and shared secret and persists
+// them. An empty relayURL disables the relay.
+func UpdateRelaySettings(relayURL, relaySecret string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.RelayURL = relayURL
+	cfg.RelaySecret = relaySecret
 	return Save()
 }
 

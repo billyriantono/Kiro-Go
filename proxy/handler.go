@@ -1,14 +1,18 @@
 package proxy
 
 import (
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
+	"kiro-go/egress"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	"kiro-go/relay"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,16 +26,16 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -2273,6 +2277,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
 		h.apiUpdateProxy(w, r)
+	case path == "/relay" && r.Method == "GET":
+		h.apiGetRelay(w, r)
+	case path == "/relay" && r.Method == "POST":
+		h.apiUpdateRelay(w, r)
+	case path == "/relay/test" && r.Method == "POST":
+		h.apiTestRelay(w, r)
+	case path == "/relay/source" && r.Method == "GET":
+		h.apiGetRelaySource(w, r)
 	case path == "/prompt-filter" && r.Method == "GET":
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
@@ -3933,6 +3945,150 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	applyProxyConfig(req.ProxyURL)
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiGetRelay returns the egress relay config. The secret is not echoed back in
+// full — only whether one is set — so it is not re-exposed to the admin client.
+func (h *Handler) apiGetRelay(w http.ResponseWriter, r *http.Request) {
+	relayURL, secret := config.GetRelaySettings()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"relayUrl":  relayURL,
+		"hasSecret": secret != "",
+	})
+}
+
+// apiUpdateRelay sets the egress relay URL + shared secret. An empty relayUrl
+// disables the relay (direct / ProxyURL egress resumes). A blank secret in the
+// request keeps the existing one, so the UI can update the URL without re-typing
+// the secret.
+func (h *Handler) apiUpdateRelay(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RelayURL    string `json:"relayUrl"`
+		RelaySecret string `json:"relaySecret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.RelayURL = strings.TrimSpace(req.RelayURL)
+	if req.RelayURL != "" && !strings.HasPrefix(req.RelayURL, "http://") && !strings.HasPrefix(req.RelayURL, "https://") {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "relayUrl must start with http:// or https://"})
+		return
+	}
+	secret := req.RelaySecret
+	if secret == "" {
+		// Preserve the existing secret when the field is left blank.
+		_, secret = config.GetRelaySettings()
+	}
+	if req.RelayURL == "" {
+		secret = "" // clearing the relay clears its secret too
+	}
+	if err := config.UpdateRelaySettings(req.RelayURL, secret); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiTestRelay sends a probe request THROUGH the given (or saved) relay to a
+// harmless upstream and reports what came back, so the operator can verify the
+// relay is reachable, the secret matches, and forwarding works before relying on
+// it. A blank secret in the request falls back to the saved one.
+func (h *Handler) apiTestRelay(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RelayURL    string `json:"relayUrl"`
+		RelaySecret string `json:"relaySecret"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	relayURL := strings.TrimSpace(req.RelayURL)
+	secret := req.RelaySecret
+	savedURL, savedSecret := config.GetRelaySettings()
+	if relayURL == "" {
+		relayURL, secret = savedURL, savedSecret
+	} else if secret == "" {
+		secret = savedSecret
+	}
+	if relayURL == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no relay configured to test"})
+		return
+	}
+
+	// Probe a lightweight AWS endpoint through the relay. Any HTTP status coming
+	// back proves the relay reached upstream; a relay-level 401/403 means wrong
+	// secret / target rejected.
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: egress.NewRelayTransportWith(http.DefaultTransport, relayURL, secret),
+	}
+	probeReq, _ := http.NewRequest("GET", "https://oidc.us-east-1.amazonaws.com/", nil)
+	resp, err := client.Do(probeReq)
+	if err != nil {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":    false,
+			"error": "relay unreachable: " + err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	relayRejected := resp.StatusCode == 401 || resp.StatusCode == 403
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":           !relayRejected,
+		"status":       resp.StatusCode,
+		"throughRelay": !relayRejected,
+		"detail":       strings.TrimSpace(string(body)),
+	})
+}
+
+// apiGetRelaySource returns the embedded relay source for a platform with the
+// shared secret BAKED IN, so the operator only deploys the code — no need to set
+// a RELAY_KEY environment variable on the serverless platform. If no relay secret
+// exists yet, one is generated and persisted (keeping any URL already entered) so
+// the baked code and the app agree on the secret.
+func (h *Handler) apiGetRelaySource(w http.ResponseWriter, r *http.Request) {
+	platform := strings.TrimSpace(r.URL.Query().Get("platform"))
+	src, ok := relay.SourceFor(platform)
+	if !ok {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "unknown platform (want cloudflare|vercel|deno)"})
+		return
+	}
+
+	relayURL, secret := config.GetRelaySettings()
+	if secret == "" {
+		secret = generateRelaySecret()
+		if err := config.UpdateRelaySettings(relayURL, secret); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	// secret is URL-safe base64 (no quotes/backslashes), so it drops safely into
+	// the JS/TS string literal placeholder.
+	src.Code = strings.ReplaceAll(src.Code, "__RELAY_KEY__", secret)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"platform": src.Platform,
+		"filename": src.Filename,
+		"language": src.Language,
+		"code":     src.Code,
+		"secret":   secret,
+	})
+}
+
+// generateRelaySecret returns a 256-bit URL-safe random token for the relay
+// shared secret.
+func generateRelaySecret() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "relay-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // apiGetVersion 获取版本信息

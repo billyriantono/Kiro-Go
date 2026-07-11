@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"kiro-go/egress"
 	"net/http"
 	"net/url"
 	"sync"
@@ -35,7 +36,7 @@ func GetAuthClientForProxy(proxyURL string) *http.Client {
 	}
 	client := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildAuthTransport(proxyURL),
+		Transport: egress.NewRelayTransport(buildAuthTransport(proxyURL)),
 	}
 	authProxyClientCache.Store(proxyURL, client)
 	return client
@@ -65,7 +66,7 @@ func buildAuthTransport(proxyURL string) *http.Transport {
 func InitHttpClient(proxyURL string) {
 	client := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildAuthTransport(proxyURL),
+		Transport: egress.NewRelayTransport(buildAuthTransport(proxyURL)),
 	}
 	httpClientStore.Store(client)
 }

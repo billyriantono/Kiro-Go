@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/egress"
 	"kiro-go/logger"
 	"net"
 	"net/http"
@@ -765,7 +766,7 @@ func oidcDiscover(issuerURL, proxyURL string) (authEndpoint, tokenEndpoint strin
 	// so a 3xx (which could point at an internal/link-local target) is a failure.
 	noRedirect := &http.Client{
 		Timeout:       30 * time.Second,
-		Transport:     buildAuthTransport(proxyURL),
+		Transport:     egress.NewRelayTransport(buildAuthTransport(proxyURL)),
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	resp, err := noRedirect.Do(req)
