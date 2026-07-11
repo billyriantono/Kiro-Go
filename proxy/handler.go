@@ -4017,14 +4017,18 @@ func (h *Handler) apiTestRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Probe a lightweight AWS endpoint through the relay. Any HTTP status coming
-	// back proves the relay reached upstream; a relay-level 401/403 means wrong
-	// secret / target rejected.
+	// Probe the relay with the X-Relay-Ping header: a ping-aware relay validates
+	// the secret and returns 200 "relay-ok" WITHOUT forwarding, giving a definitive
+	// positive that doesn't depend on what any upstream returns. Older relays
+	// (deployed before ping) ignore the header and forward the request instead —
+	// handled by the classification below. The probe target is a real allow-listed
+	// AWS host so a forwarding relay still gets a valid HTTP response.
 	client := &http.Client{
 		Timeout:   15 * time.Second,
 		Transport: egress.NewRelayTransportWith(http.DefaultTransport, relayURL, secret),
 	}
 	probeReq, _ := http.NewRequest("GET", "https://oidc.us-east-1.amazonaws.com/", nil)
+	probeReq.Header.Set("X-Relay-Ping", "1")
 	resp, err := client.Do(probeReq)
 	if err != nil {
 		w.WriteHeader(200)
@@ -4036,13 +4040,32 @@ func (h *Handler) apiTestRelay(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	relayRejected := resp.StatusCode == 401 || resp.StatusCode == 403
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"ok":           !relayRejected,
-		"status":       resp.StatusCode,
-		"throughRelay": !relayRejected,
-		"detail":       strings.TrimSpace(string(body)),
-	})
+	bodyStr := strings.ToLower(strings.TrimSpace(string(body)))
+
+	// Classify. Only a RELAY-level rejection is a failure; an upstream status
+	// (e.g. AWS answering 403 to a bare GET) means the relay forwarded fine.
+	var ok bool
+	var reason string
+	switch {
+	case resp.StatusCode == 200 && strings.Contains(bodyStr, "relay-ok"):
+		ok, reason = true, "ping ok" // ping-aware relay, secret verified
+	case resp.StatusCode == 401 && (bodyStr == "" || strings.Contains(bodyStr, "unauthor")):
+		ok, reason = false, "wrong secret (relay returned 401 unauthorized)"
+	case resp.StatusCode == 403 && strings.Contains(bodyStr, "target not allowed"):
+		ok, reason = false, "target host not on the relay allow-list"
+	default:
+		// Any other HTTP response came back THROUGH the relay from upstream.
+		ok, reason = true, "forwarded to upstream"
+	}
+	out := map[string]interface{}{
+		"ok":     ok,
+		"status": resp.StatusCode,
+		"detail": reason,
+	}
+	if !ok {
+		out["error"] = reason
+	}
+	json.NewEncoder(w).Encode(out)
 }
 
 // apiGetRelaySource returns the embedded relay source for a platform with the

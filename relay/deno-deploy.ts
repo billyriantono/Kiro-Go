@@ -31,11 +31,15 @@ function hostAllowed(host: string): boolean {
 Deno.serve(async (request: Request) => {
   const target = request.headers.get("X-Relay-Target");
   const key = request.headers.get("X-Relay-Key") || "";
-  if (!target) return new Response("missing X-Relay-Target", { status: 400 });
   const expected = Deno.env.get("RELAY_KEY") || RELAY_KEY;
   if (expected && expected !== "__RELAY_KEY__" && key !== expected) {
     return new Response("unauthorized", { status: 401 });
   }
+  // Health probe from the Kiro-Go admin "Test relay" button.
+  if (request.headers.get("X-Relay-Ping")) {
+    return new Response("relay-ok", { status: 200 });
+  }
+  if (!target) return new Response("missing X-Relay-Target", { status: 400 });
   let url: URL;
   try {
     url = new URL(target);
