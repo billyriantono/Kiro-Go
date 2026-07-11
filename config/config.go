@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"kiro-go/logger"
 	"os"
 	"runtime"
 	"sync"
@@ -260,6 +261,7 @@ func Init(path string) error {
 		return err
 	}
 	store = st
+	logger.Infof("[config] storage backend: %s", st.Backend())
 	return Load()
 }
 
@@ -287,6 +289,8 @@ func Load() error {
 			if err := saveLocked(); err != nil {
 				return err
 			}
+			logger.Infof("[config] migrated existing config.json into the %s backend (%d accounts, %d api keys)",
+				store.Backend(), len(cfg.Accounts), len(cfg.ApiKeys))
 			return migrateLoaded()
 		}
 		// Create default configuration.
@@ -300,10 +304,13 @@ func Load() error {
 			RequireApiKey: false,
 			Accounts:      []Account{},
 		}
+		logger.Infof("[config] fresh %s backend initialized (no data to migrate) — complete initial setup at /admin", store.Backend())
 		return saveLocked()
 	}
 
 	cfg = loaded
+	logger.Infof("[config] loaded from %s backend (%d accounts, %d api keys, configured=%t)",
+		store.Backend(), len(cfg.Accounts), len(cfg.ApiKeys), cfg.Password != "")
 	return migrateLoaded()
 }
 

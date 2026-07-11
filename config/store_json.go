@@ -71,3 +71,5 @@ func (s *jsonStore) Save(cfg *Config) error {
 }
 
 func (s *jsonStore) Close() error { return nil }
+
+func (s *jsonStore) Backend() string { return "json:" + s.path }

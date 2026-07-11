@@ -54,6 +54,15 @@ func newSQLStore(driver, dsn string) (*sqlStore, error) {
 
 func (s *sqlStore) Close() error { return s.db.Close() }
 
+// Backend returns a secret-free label ("sqlite" / "postgres") for logging — the
+// DSN is deliberately never included since it may carry credentials.
+func (s *sqlStore) Backend() string {
+	if s.driver == "pgx" {
+		return "postgres"
+	}
+	return "sqlite"
+}
+
 // rebind converts "?" placeholders to "$1, $2, …" for the pgx driver; SQLite
 // takes "?" as-is.
 func (s *sqlStore) rebind(query string) string {

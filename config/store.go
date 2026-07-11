@@ -26,6 +26,9 @@ type Store interface {
 	Save(cfg *Config) error
 	// Close releases backend resources (a no-op for the file backend).
 	Close() error
+	// Backend returns a short, secret-free label for startup logging
+	// (e.g. "sqlite", "postgres", "json:/app/data/config.json").
+	Backend() string
 }
 
 // storeBackendEnv selects the persistence backend. Unset/"json"/"file" keeps the
