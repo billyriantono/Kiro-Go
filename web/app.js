@@ -21,6 +21,8 @@
   let promptRules = [];
   let builderIdSession = '';
   let builderIdPollTimer = null;
+  let kiroSsoSession = '';
+  let kiroSsoPollTimer = null;
   let iamSession = '';
   let exportSelectedIds = new Set();
   let currentVersion = '';
@@ -610,6 +612,48 @@
       localStorage.removeItem('admin_login_time');
       localStorage.removeItem('kiro_remember');
       localStorage.removeItem('kiro_remembered_pwd');
+    }
+  }
+  // First-run setup: if the instance has no admin password yet, show the setup
+  // box instead of the login form. Returns true when setup is required (so the
+  // caller skips auto-login).
+  async function checkSetup() {
+    try {
+      const res = await fetch('/admin/api/setup/status');
+      const d = await res.json();
+      if (!d.configured) {
+        $('loginBox').classList.add('hidden');
+        $('setupBox').classList.remove('hidden');
+        return true;
+      }
+    } catch (e) { }
+    $('setupBox').classList.add('hidden');
+    $('loginBox').classList.remove('hidden');
+    return false;
+  }
+  async function completeSetup() {
+    const pwd = $('setupPwdField').value;
+    const confirm = $('setupPwdConfirm').value;
+    if (pwd.length < 8) { toast(t('setup.tooShort'), 'error'); return; }
+    if (pwd !== confirm) { toast(t('setup.mismatch'), 'error'); return; }
+    try {
+      const res = await fetch('/admin/api/setup', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pwd })
+      });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        toast(t('setup.success'), 'primary');
+        // Log straight in with the freshly-set password.
+        setActivePassword(pwd, false);
+        $('setupBox').classList.add('hidden');
+        $('loginBox').classList.remove('hidden');
+        showMain(); loadData();
+      } else {
+        toast((d.error || t('common.failed')), 'error');
+      }
+    } catch (e) {
+      toast(t('login.connectError'), 'error');
     }
   }
   async function tryAutoLogin() {
@@ -1433,7 +1477,7 @@
     const acc = getTestAccount(testModalAccountId);
     const idAttr = escapeAttr(testModalAccountId);
     const email = acc ? getDisplayEmail(acc.email, acc.id) : testModalAccountId;
-    const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
+    const proxy = acc ? (acc.proxyURL || (relayActive ? t('accounts.testLog.relay') : t('accounts.testLog.globalProxy'))) : '?';
     const statusText = testModalLoadingModels
       ? t('accounts.testModelsLoading')
       : testModalModelError
@@ -1510,7 +1554,7 @@
     if (modalBtn) modalBtn.setAttribute('aria-busy', 'true');
     const acc = accountsData.find(a => a.id === id);
     const email = acc ? getDisplayEmail(acc.email, acc.id) : id;
-    const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
+    const proxy = acc ? (acc.proxyURL || (relayActive ? t('accounts.testLog.relay') : t('accounts.testLog.globalProxy'))) : '?';
     addTestLog(t('accounts.testLog.start', email, model, proxy), 'info');
     try {
       const startTime = Date.now();
@@ -1535,7 +1579,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadRelayConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1574,13 +1618,22 @@
     if (d.success) toast(t('settings.endpointSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
+  // relayActive mirrors the server's outbound mode so the test log can label the
+  // egress correctly (Egress Relay vs Global Proxy).
+  let relayActive = false;
   async function loadProxyConfig() {
     const res = await api('/proxy');
     const d = await res.json();
+    relayActive = !!d.useRelay;
+    if (relayActive) {
+      $('proxyType').value = 'relay';
+      onProxyTypeChange();
+      return;
+    }
     const url = d.proxyURL || '';
     if (!url) {
       $('proxyType').value = 'none';
-      $('proxyFields').classList.add('hidden');
+      onProxyTypeChange();
       return;
     }
     try {
@@ -1591,18 +1644,30 @@
       $('proxyPort').value = u.port;
       $('proxyUsername').value = decodeURIComponent(u.username);
       $('proxyPassword').value = decodeURIComponent(u.password);
-      $('proxyFields').classList.remove('hidden');
+      onProxyTypeChange();
     } catch (e) {
       $('proxyType').value = 'none';
-      $('proxyFields').classList.add('hidden');
+      onProxyTypeChange();
     }
   }
   function onProxyTypeChange() {
     const type = $('proxyType').value;
-    $('proxyFields').classList.toggle('hidden', type === 'none');
+    // Proxy host/port fields apply only to socks5/http; the relay is configured in
+    // its own section below.
+    $('proxyFields').classList.toggle('hidden', type === 'none' || type === 'relay');
+    const hint = $('proxyRelayHint');
+    if (hint) hint.classList.toggle('hidden', type !== 'relay');
   }
   async function saveProxyConfig() {
     const type = $('proxyType').value;
+    if (type === 'relay') {
+      if (!$('relayUrl').value.trim()) { toast(t('relay.needUrl'), 'warning'); return; }
+      const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ useRelay: true }) });
+      const d = await res.json();
+      if (d.success) { relayActive = true; toast(t('settings.proxySaved'), 'success'); }
+      else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+      return;
+    }
     let url = '';
     if (type !== 'none') {
       const host = $('proxyHost').value.trim();
@@ -1613,10 +1678,87 @@
       const auth = u ? (p ? encodeURIComponent(u) + ':' + encodeURIComponent(p) + '@' : encodeURIComponent(u) + '@') : '';
       url = type + '://' + auth + host + ':' + port;
     }
-    const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ proxyURL: url }) });
+    const res = await api('/proxy', { method: 'POST', body: JSON.stringify({ proxyURL: url, useRelay: false }) });
     const d = await res.json();
-    if (d.success) toast(t('settings.proxySaved'), 'success');
+    if (d.success) { relayActive = false; toast(t('settings.proxySaved'), 'success'); }
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  // --- Egress relay (Cloudflare / Vercel / Deno) ---
+  async function loadRelayConfig() {
+    try {
+      const res = await api('/relay');
+      const d = await res.json();
+      $('relayUrl').value = d.relayUrl || '';
+      // Never round-trip the secret to the client; show a hint if one is stored.
+      $('relaySecret').value = '';
+      $('relaySecretHint').textContent = d.hasSecret ? t('relay.secretStored') : '';
+    } catch (e) { }
+  }
+  async function saveRelayConfig() {
+    const relayUrl = $('relayUrl').value.trim();
+    const relaySecret = $('relaySecret').value;
+    const res = await api('/relay', { method: 'POST', body: JSON.stringify({ relayUrl, relaySecret }) });
+    const d = await res.json();
+    if (d.success) { toast(t('relay.saved'), 'success'); loadRelayConfig(); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function testRelayConfig() {
+    const relayUrl = $('relayUrl').value.trim();
+    const relaySecret = $('relaySecret').value;
+    if (!relayUrl) { toast(t('relay.needUrl'), 'warning'); return; }
+    toast(t('relay.testing'), 'primary');
+    try {
+      const res = await api('/relay/test', { method: 'POST', body: JSON.stringify({ relayUrl, relaySecret }) });
+      const d = await res.json();
+      if (d.ok) toast(t('relay.testOk') + ' (HTTP ' + d.status + ')', 'success');
+      else toast(t('relay.testFail') + ': ' + (d.error || ('HTTP ' + d.status + ' ' + (d.detail || ''))), 'error');
+    } catch (e) {
+      toast(t('relay.testFail') + ': ' + e, 'error');
+    }
+  }
+  function toggleDeployRelayMenu(show) {
+    const menu = $('deployRelayMenu');
+    if (!menu) return;
+    if (show === undefined) menu.classList.toggle('hidden');
+    else menu.classList.toggle('hidden', !show);
+  }
+  // openInfoModal reuses the shared addModal shell for read-only content. bodyHtml
+  // is composed only from escaped values + trusted i18n strings (same pattern as
+  // the other modalXxx builders); the relay code itself is injected via textContent.
+  function openInfoModal(titleText, bodyHtml) {
+    $('modalTitle').textContent = titleText;
+    $('modalBody').innerHTML = bodyHtml;
+    if (!$('addModal').classList.contains('active')) openDialog('addModal');
+  }
+  async function showRelaySource(platform) {
+    toggleDeployRelayMenu(false);
+    try {
+      const res = await api('/relay/source?platform=' + encodeURIComponent(platform));
+      const d = await res.json();
+      if (d.error) { toast(d.error, 'error'); return; }
+      // The server baked (and persisted) the shared secret into the code, so the
+      // operator never touches a platform env var. Reflect it in the form.
+      if (d.secret) {
+        $('relaySecret').value = d.secret;
+        $('relaySecretHint').textContent = t('relay.secretBaked');
+      }
+      const steps = t('relay.steps.' + platform);
+      const body =
+        '<p class="help-block">' + escapeHtml(steps) + '</p>' +
+        '<div class="flex justify-between items-center mb-2">' +
+        '<span class="font-mono text-xs">' + escapeHtml(d.filename) + '</span>' +
+        '<button class="btn btn-sm btn-outline" id="relayCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+        '</div>' +
+        '<pre style="max-height:50vh;overflow:auto;background:var(--code-bg,#0e0e12);padding:1rem;border-radius:.5rem"><code class="text-xs" id="relaySrcCode"></code></pre>';
+      openInfoModal(t('relay.deploy') + ' — ' + t('relay.' + platform), body);
+      $('relaySrcCode').textContent = d.code;
+      $('relayCopyBtn').addEventListener('click', async () => {
+        await copyText(d.code);
+        toast(t('common.copied'), 'primary');
+      });
+    } catch (e) {
+      toast(String(e), 'error');
+    }
   }
   async function saveRequireApiKey() {
     try {
@@ -2019,6 +2161,7 @@
   var METHOD_ICONS = {
     builderid: 'fa-solid fa-id-card',
     iam: 'fa-solid fa-key',
+    enterprisesso: 'fa-brands fa-microsoft',
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
@@ -2042,6 +2185,7 @@
     if (type === 'add') modalAdd(title, body);
     else if (type === 'builderid') modalBuilderId(title, body);
     else if (type === 'iam') modalIam(title, body);
+    else if (type === 'enterprisesso') modalEnterpriseSso(title, body);
     else if (type === 'sso') modalSso(title, body);
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
@@ -2054,6 +2198,14 @@
     iamSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
+    if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
+    // If a hosted-portal sign-in is still in flight (modal closed via X/backdrop
+    // before completion), release the loopback port now. On successful completion
+    // the poller clears kiroSsoSession first, so this no-ops then.
+    if (kiroSsoSession) {
+      api('/auth/kiro-sso/cancel', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) }).catch(() => {});
+    }
+    kiroSsoSession = '';
   }
   function modalAdd(title, body) {
     title.textContent = t('modal.addAccount');
@@ -2061,6 +2213,7 @@
       '<div class="method-list">' +
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
+      methodCard('enterprisesso', t('modal.enterpriseSsoTitle'), t('modal.enterpriseSsoDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
@@ -2277,11 +2430,19 @@
           const c = a.credentials || {};
           return {
             refreshToken: c.refreshToken || a.refreshToken,
+            accessToken: c.accessToken || a.accessToken,
             clientId: c.clientId || a.clientId,
             clientSecret: c.clientSecret || a.clientSecret,
             region: c.region || a.region,
             authMethod: c.authMethod || a.authMethod,
-            provider: c.provider || a.provider || a.idp
+            provider: c.provider || a.provider || a.idp,
+            tokenEndpoint: c.tokenEndpoint || a.tokenEndpoint,
+            issuerUrl: c.issuerUrl || a.issuerUrl,
+            scopes: c.scopes || a.scopes,
+            id: a.id,
+            email: c.email || a.email,
+            profileArn: c.profileArn || a.profileArn,
+            userId: a.userId
           };
         });
       } else {
@@ -2303,11 +2464,19 @@
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
       if (!item.refreshToken) { fail++; continue; }
-      let authMethod = item.authMethod || '';
-      if (item.clientId && item.clientSecret) authMethod = 'idc';
-      else if (!authMethod || authMethod === 'social') authMethod = 'social';
-      else authMethod = authMethod.toLowerCase() === 'idc' ? 'idc' : 'social';
+      const EXTERNAL_IDP = ['external_idp','azuread','azure','entra','entra-id','microsoft','m365','office365','external'];
+      let authMethod = (item.authMethod || '').toLowerCase();
+      if (EXTERNAL_IDP.includes(authMethod) || item.tokenEndpoint) {
+        authMethod = 'external_idp';
+      } else if (item.clientId && item.clientSecret) {
+        authMethod = 'idc';
+      } else if (!authMethod || authMethod === 'social') {
+        authMethod = 'social';
+      } else {
+        authMethod = authMethod === 'idc' ? 'idc' : 'social';
+      }
       let provider = item.provider || '';
+      if (!provider && authMethod === 'external_idp') provider = 'AzureAD';
       if (!provider && authMethod === 'social') provider = 'Google';
       if (!provider && authMethod === 'idc') provider = 'BuilderId';
       const payload = {
@@ -2316,7 +2485,13 @@
         clientId: item.clientId || '',
         clientSecret: item.clientSecret || '',
         authMethod, provider,
-        region: item.region || 'us-east-1'
+        region: item.region || 'us-east-1',
+        tokenEndpoint: item.tokenEndpoint || '',
+        issuerUrl: item.issuerUrl || '',
+        scopes: item.scopes || '',
+        ...(item.id ? { id: item.id } : {}),
+        ...(item.email ? { email: item.email } : {}),
+        ...(item.profileArn ? { profileArn: item.profileArn } : {})
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -2427,6 +2602,114 @@
   function cancelBuilderIdLogin() {
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
     builderIdSession = '';
+    showModal('add');
+  }
+  // Enterprise SSO — Microsoft 365 / Entra ID (Azure AD), via the Kiro hosted sign-in portal.
+  // The backend binds a loopback listener and returns the sign-in URL; the browser is driven
+  // through the external-IdP leg automatically, and we poll until the account is created.
+  function modalEnterpriseSso(title, body) {
+    title.textContent = t('modal.enterpriseSsoTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.enterpriseSsoDesc')) + '</p>' +
+      '<div id="kiroSsoStep1">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.hostNote')) + '</p></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="startKiroSsoBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div id="kiroSsoStep2" class="hidden">' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.openInstruction')) + '</p></div>' +
+      '<div class="form-group mt-3"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
+      '<div class="endpoint"><span id="kiroSsoSignInUrl" class="font-mono text-xs"></span></div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+      '<button class="btn btn-sm btn-outline flex-1" id="kiroSsoCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="form-group mt-3"><label>' + escapeHtml(t('kirosso.relayLabel')) + '</label>' +
+      '<div class="message message-info"><p class="text-xs">' + escapeHtml(t('kirosso.relayNote')) + '</p></div>' +
+      '<input id="kiroSsoRelayUrl" type="text" class="font-mono text-xs" placeholder="http://localhost:3128/...">' +
+      '<button class="btn btn-sm btn-outline mt-2" id="kiroSsoRelayBtn" type="button">' + escapeHtml(t('kirosso.relaySubmit')) + '</button>' +
+      '</div>' +
+      '<p id="kiroSsoStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
+      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '</div>';
+    $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
+  }
+  async function startKiroSsoLogin() {
+    // No region prompt: the data-plane region is derived from the profile ARN
+    // returned by SSO (social) or discovered via the cross-region profile probe
+    // (external_idp / Azure), so the operator never has to know it up front.
+    const res = await api('/auth/kiro-sso/start', { method: 'POST', body: JSON.stringify({}) });
+    const d = await res.json();
+    if (d.sessionId && d.signInUrl) {
+      kiroSsoSession = d.sessionId;
+      $('kiroSsoSignInUrl').textContent = d.signInUrl;
+      $('kiroSsoStep1').classList.add('hidden');
+      $('kiroSsoStep2').classList.remove('hidden');
+      $('kiroSsoOpenBtn').addEventListener('click', () => window.open($('kiroSsoSignInUrl').textContent, '_blank'));
+      $('kiroSsoCopyBtn').addEventListener('click', async () => {
+        await copyText($('kiroSsoSignInUrl').textContent);
+        toast(t('common.copied'), 'primary');
+      });
+      $('kiroSsoCancelBtn').addEventListener('click', cancelKiroSsoLogin);
+      $('kiroSsoRelayBtn').addEventListener('click', relayKiroSsoUrl);
+      // Open the sign-in tab immediately (works when the admin panel is viewed on the proxy host).
+      window.open(d.signInUrl, '_blank');
+      pollKiroSso(d.interval || 2);
+    } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  // Remote-browser relay: when the browser runs on a different machine than the
+  // proxy, the localhost:3128 redirects fail to connect there — but the full URL
+  // survives in the address bar. The operator pastes it here and the backend feeds
+  // it through the same callback state machine (state checks included). The
+  // enterprise flow needs this twice: the portal descriptor (which returns the IdP
+  // authorize URL to open next) and the final code redirect.
+  async function relayKiroSsoUrl() {
+    const raw = $('kiroSsoRelayUrl').value.trim();
+    if (!raw || !kiroSsoSession) return;
+    const res = await api('/auth/kiro-sso/relay', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession, url: raw }) });
+    const d = await res.json();
+    if (d.success && d.authorizeUrl) {
+      $('kiroSsoRelayUrl').value = '';
+      window.open(d.authorizeUrl, '_blank');
+      toast(t('kirosso.relayContinue'), 'primary');
+    } else if (d.success && d.done) {
+      $('kiroSsoRelayUrl').value = '';
+      $('kiroSsoStatus').textContent = t('builderid.waiting');
+    } else {
+      toastError(t('common.failed') + ': ' + (d.error || ''));
+    }
+  }
+  function pollKiroSso(interval) {
+    kiroSsoPollTimer = setTimeout(async () => {
+      const res = await api('/auth/kiro-sso/poll', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) });
+      const d = await res.json();
+      if (d.completed) {
+        // Session is already consumed server-side; clear it so closeModal() does
+        // not fire a redundant cancel for an account that succeeded.
+        kiroSsoSession = '';
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else if (d.success && !d.completed) {
+        $('kiroSsoStatus').textContent = t('builderid.waiting');
+        pollKiroSso(interval);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+        cancelKiroSsoLogin();
+      }
+    }, interval * 1000);
+  }
+  function cancelKiroSsoLogin() {
+    if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
+    // Tell the backend to release the loopback callback port now instead of waiting
+    // for the deadline (fire-and-forget; ignore the result).
+    if (kiroSsoSession) {
+      api('/auth/kiro-sso/cancel', { method: 'POST', body: JSON.stringify({ sessionId: kiroSsoSession }) }).catch(() => {});
+    }
+    kiroSsoSession = '';
     showModal('add');
   }
   async function startIamSso() {
@@ -2696,6 +2979,12 @@
     $('loginBtn').addEventListener('click', login);
     $('pwdField').addEventListener('keypress', e => { if (e.key === 'Enter') login(); });
 
+    const setupBtn = $('setupBtn');
+    if (setupBtn) {
+      setupBtn.addEventListener('click', completeSetup);
+      $('setupPwdConfirm').addEventListener('keypress', e => { if (e.key === 'Enter') completeSetup(); });
+    }
+
     const pwdToggle = $('pwdToggle');
     if (pwdToggle) {
       pwdToggle.addEventListener('click', () => {
@@ -2814,8 +3103,24 @@
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
+    bindRelayEvents();
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
+  }
+
+  function bindRelayEvents() {
+    const saveBtn = $('saveRelayBtn');
+    if (!saveBtn) return;
+    saveBtn.addEventListener('click', saveRelayConfig);
+    $('testRelayBtn').addEventListener('click', testRelayConfig);
+    $('deployRelayBtn').addEventListener('click', (e) => { e.stopPropagation(); toggleDeployRelayMenu(); });
+    document.querySelectorAll('.relay-deploy-item').forEach(btn => {
+      btn.addEventListener('click', () => showRelaySource(btn.dataset.relayPlatform));
+    });
+    // Close the deploy menu when clicking elsewhere.
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.relay-deploy-wrap')) toggleDeployRelayMenu(false);
+    });
   }
 
   function bindPromptFilterEvents() {
@@ -3133,7 +3438,8 @@
     const yr = $('footerYear');
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
-    if (password) tryAutoLogin();
+    const setupRequired = await checkSetup();
+    if (!setupRequired && password) tryAutoLogin();
     setInterval(() => {
       if (!$('mainPage').classList.contains('hidden')) loadStats();
     }, 10000);

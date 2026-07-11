@@ -1,13 +1,18 @@
 package proxy
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
+	"kiro-go/egress"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	"kiro-go/relay"
 	"net/http"
 	"strings"
 	"sync"
@@ -21,16 +26,16 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -2145,7 +2150,23 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 // ==================== 管理 API ====================
 
 func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
-	// 验证密码
+	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
+
+	// First-run setup endpoints bypass the password gate BUT only function while
+	// the instance is unconfigured (empty password). This replaces the old
+	// "changeme" default: a fresh deploy has no password and the admin UI forces
+	// the setup screen. setup/status is always readable so the UI can branch.
+	if path == "/setup/status" && r.Method == "GET" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]interface{}{"configured": config.IsConfigured()})
+		return
+	}
+	if path == "/setup" && r.Method == "POST" {
+		h.apiCompleteSetup(w, r)
+		return
+	}
+
+	// 验证密码 — constant-time to avoid leaking length/prefix via comparison timing.
 	password := r.Header.Get("X-Admin-Password")
 	if password == "" {
 		cookie, _ := r.Cookie("admin_password")
@@ -2154,13 +2175,18 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if password != config.GetPassword() {
+	if !config.IsConfigured() {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(401)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Setup required", "setupRequired": "true"})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(password), []byte(config.GetPassword())) != 1 {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	switch {
@@ -2211,6 +2237,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartBuilderIdLogin(w, r)
 	case path == "/auth/builderid/poll" && r.Method == "POST":
 		h.apiPollBuilderIdAuth(w, r)
+	case path == "/auth/kiro-sso/start" && r.Method == "POST":
+		h.apiStartKiroSso(w, r)
+	case path == "/auth/kiro-sso/poll" && r.Method == "POST":
+		h.apiPollKiroSso(w, r)
+	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
+		h.apiCancelKiroSso(w, r)
+	case path == "/auth/kiro-sso/relay" && r.Method == "POST":
+		h.apiRelayKiroSso(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
 	case path == "/auth/credentials" && r.Method == "POST":
@@ -2243,6 +2277,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
 		h.apiUpdateProxy(w, r)
+	case path == "/relay" && r.Method == "GET":
+		h.apiGetRelay(w, r)
+	case path == "/relay" && r.Method == "POST":
+		h.apiUpdateRelay(w, r)
+	case path == "/relay/test" && r.Method == "POST":
+		h.apiTestRelay(w, r)
+	case path == "/relay/source" && r.Method == "GET":
+		h.apiGetRelaySource(w, r)
 	case path == "/prompt-filter" && r.Method == "GET":
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
@@ -2805,6 +2847,191 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiStartKiroSso starts the Kiro hosted-portal sign-in (Enterprise SSO — Microsoft 365 /
+// Entra ID, plus Google/GitHub). It binds the loopback callback listener and returns the
+// sign-in URL the operator opens in a browser ON THE SAME HOST as the proxy (the OAuth
+// redirect targets 127.0.0.1:3128). The browser is driven through the enterprise external-IdP
+// leg automatically; the front end polls /auth/kiro-sso/poll until completion.
+func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Region string `json:"region"`
+	}
+	// Region is optional (defaults to us-east-1 in StartKiroSsoLogin), so a decode
+	// error (including an empty body) is intentionally tolerated — mirrors
+	// apiStartBuilderIdLogin.
+	json.NewDecoder(r.Body).Decode(&req)
+
+	session, signInURL, err := auth.StartKiroSsoLogin(req.Region)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId": session.ID,
+		"signInUrl": signInURL,
+		"interval":  2,
+	})
+}
+
+// apiCancelKiroSso tears down an in-flight hosted-portal sign-in (operator closed or
+// cancelled the modal), freeing the loopback callback port immediately instead of
+// waiting for the deadline.
+func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.SessionID != "" {
+		auth.CancelKiroSsoLogin(req.SessionID)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// apiCompleteSetup handles the first-run initial-setup submission: it sets the
+// admin password on an unconfigured instance. config.CompleteSetup refuses once a
+// password already exists, so this unauthenticated endpoint cannot overwrite the
+// credentials of a configured instance (it only closes the fresh-install window).
+func (h *Handler) apiCompleteSetup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if config.IsConfigured() {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Already configured"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if len(strings.TrimSpace(req.Password)) < 8 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Password must be at least 8 characters"})
+		return
+	}
+	if err := config.CompleteSetup(req.Password); err != nil {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// apiRelayKiroSso accepts a redirect URL the operator pasted from a browser on a
+// DIFFERENT machine than the proxy (where the localhost:3128 redirects cannot land)
+// and feeds it through the active session's callback state machine. Both legs go
+// through here: the enterprise leg-1 descriptor returns the IdP authorize URL the
+// operator's browser must open next; the leg-2 code (or the social code) completes
+// the capture and the regular poll picks it up. All anti-CSRF state checks apply
+// unchanged, and the endpoint sits behind the admin-password gate.
+func (h *Handler) apiRelayKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+		URL       string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.SessionID == "" || strings.TrimSpace(req.URL) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and url are required"})
+		return
+	}
+
+	authorizeURL, done, err := auth.RelayKiroSsoCallback(req.SessionID, req.URL)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"done":         done,
+		"authorizeUrl": authorizeURL,
+	})
+}
+
+// apiPollKiroSso reports the hosted-portal sign-in status. While the user is signing in it
+// returns completed=false; once the listener captures the authorization code it exchanges it,
+// persists the account (AuthMethod "external_idp" for an Azure tenant, "social" otherwise), and
+// returns completed=true. The profileArn is resolved lazily on first use (the EXTERNAL_IDP
+// token type header is now sent on CodeWhisperer calls), so it is not required here.
+func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	result, status, err := auth.PollKiroSsoAuth(req.SessionID)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"completed": false,
+			"status":    "pending",
+		})
+		return
+	}
+
+	// 授权完成，创建账号
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    result.AuthMethod,
+		Provider:      result.Provider,
+		Region:        result.Region,
+		ProfileArn:    result.ProfileArn,
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerURL:     result.IssuerURL,
+		Scopes:        result.Scopes,
+		ExpiresAt:     time.Now().Unix() + int64(result.ExpiresIn),
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":   true,
+		"completed": true,
+		"account": map[string]interface{}{
+			"id":         account.ID,
+			"email":      account.Email,
+			"authMethod": account.AuthMethod,
+		},
+	})
+}
+
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		BearerToken string `json:"bearerToken"`
@@ -2887,6 +3114,11 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
+	// Cap the body: accessToken becomes attacker-influenced input that is base64- and
+	// JSON-decoded twice (issuerFromAccessTokenJWT / ExpFromAccessTokenJWT). Without a
+	// limit an oversized token is a memory-amplification DoS. Mirrors the io.LimitReader
+	// guard on outbound IdP responses in auth/kiro_sso.go's oidcDiscover.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
@@ -2895,6 +3127,17 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		AuthMethod   string `json:"authMethod"`
 		Provider     string `json:"provider"`
 		Region       string `json:"region"`
+		// external_idp (enterprise SSO / Azure AD) refresh material.
+		TokenEndpoint string `json:"tokenEndpoint"`
+		IssuerURL     string `json:"issuerUrl"`
+		Scopes        string `json:"scopes"`
+		// Optional identity preservation when pasting a full account record.
+		ID         string `json:"id"`
+		Email      string `json:"email"`
+		ProfileArn string `json:"profileArn"`
+		// userId (account-level in Kiro Account Manager exports) embeds the Azure
+		// tenant, from which tokenEndpoint/issuerUrl/scopes are derived when missing.
+		UserID string `json:"userId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2912,65 +3155,141 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	if req.Region == "" {
 		req.Region = "us-east-1"
 	}
-	if req.AuthMethod == "" {
-		if req.ClientID != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
-		}
+	// 标准化 authMethod。external_idp 必须先于 clientId+clientSecret→idc 的推断被识别
+	//（external_idp 带 clientId 但没有 clientSecret），否则会被误判成 social 而 refresh 到错误端点。
+	req.AuthMethod = normalizeImportAuthMethod(req.AuthMethod, req.ClientID, req.ClientSecret, req.TokenEndpoint)
+
+	// Resolve Azure endpoints from userId (Kiro export, account level) or the
+	// accessToken JWT issuer (bare blobs: clientId + token only). A derivation that
+	// also clears the allow-list is itself proof the credential is external_idp —
+	// IdC/social access tokens are not microsoftonline JWTs, so a bare IdC blob (its
+	// iss is an AWS host) won't clear the list and won't be misclassified.
+	derivedTE, derivedIss, derivedSc := auth.DeriveExternalIdpEndpoints(req.UserID, req.ClientID, req.AccessToken)
+	if derivedTE != "" && auth.ValidateExternalIdpEndpoint(derivedTE) == nil && req.AuthMethod != "external_idp" {
+		req.AuthMethod = "external_idp"
 	}
-	// 标准化 authMethod
-	switch strings.ToLower(req.AuthMethod) {
-	case "idc", "builderid", "enterprise":
-		req.AuthMethod = "idc"
-	case "social", "google", "github":
-		req.AuthMethod = "social"
-	default:
-		if req.ClientID != "" && req.ClientSecret != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
+
+	// external_idp 的 tokenEndpoint 是用户可填的新信任边界：必须经 allow-list 校验，
+	// 否则一份不信任的 credential JSON 可指向内网/攻击者主机，导致 refresh token 被外泄。
+	if req.AuthMethod == "external_idp" {
+		// Kiro Account Manager exports and bare blobs omit tokenEndpoint/issuerUrl/
+		// scopes; fill them from the derived (userId or accessToken-JWT) tenant.
+		if req.TokenEndpoint == "" {
+			req.TokenEndpoint = derivedTE
+		}
+		if req.IssuerURL == "" {
+			req.IssuerURL = derivedIss
+		}
+		if req.Scopes == "" {
+			req.Scopes = derivedSc
+		}
+		if req.ClientID == "" || req.TokenEndpoint == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "external_idp requires clientId and tokenEndpoint (or userId/accessToken to derive it)"})
+			return
+		}
+		if err := auth.ValidateExternalIdpEndpoint(req.TokenEndpoint); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "external IdP endpoint rejected: " + err.Error()})
+			return
+		}
+		if req.IssuerURL != "" {
+			if err := auth.ValidateExternalIdpEndpoint(req.IssuerURL); err != nil {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "external IdP issuer rejected: " + err.Error()})
+				return
+			}
 		}
 	}
 
-	// 用 refreshToken 刷新获取新的 accessToken。导入必须以一次成功的刷新为前提：
-	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
-	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
-	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
+	// Resolve the access token to persist. For external_idp we prefer TRUST-ON-IMPORT:
+	// when the pasted JSON carries an Azure AD access token (a JWT with a real exp),
+	// persist it directly WITHOUT a live refresh round-trip. The JSON can then be
+	// imported repeatedly / into multiple instances without each import consuming
+	// (rotating) the refresh token, and without requiring egress to Microsoft at
+	// import time. The runtime background refresh (backgroundRefresh /
+	// ensureValidToken) renews it later when the account is actually used. Falls
+	// back to refresh-at-import for idc/social and for external_idp credentials
+	// carrying only a refreshToken (so the regression gate — reject when refresh
+	// fails — still holds there).
+	var (
+		accessToken string
+		expiresAt   int64
+		profileArn  string
+	)
+	email := req.Email
+	if req.AuthMethod == "external_idp" && req.AccessToken != "" {
+		if exp := auth.ExpFromAccessTokenJWT(req.AccessToken); exp > 0 {
+			// The exp comes from an UNVERIFIED JWT: clamp it to a sane horizon so a
+			// crafted far-future exp cannot pin a dead token as forever-valid (the
+			// background refresh would otherwise never renew it). Azure AD access
+			// tokens live ~1h; 24h is a generous ceiling.
+			if maxExp := time.Now().Add(24 * time.Hour).Unix(); exp > maxExp {
+				exp = maxExp
+			}
+			accessToken = req.AccessToken
+			expiresAt = exp
+			profileArn = req.ProfileArn
+		}
 	}
-	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
-	if err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-		return
+	if accessToken == "" {
+		tempAccount := &config.Account{
+			RefreshToken:  req.RefreshToken,
+			ClientID:      req.ClientID,
+			ClientSecret:  req.ClientSecret,
+			AuthMethod:    req.AuthMethod,
+			Region:        req.Region,
+			TokenEndpoint: req.TokenEndpoint,
+			Scopes:        req.Scopes,
+		}
+		a, newRT, ea, newPA, err := auth.RefreshToken(tempAccount)
+		if err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+			return
+		}
+		accessToken = a
+		expiresAt = ea
+		profileArn = newPA
+		if newRT != "" {
+			req.RefreshToken = newRT
+		}
+		if fetchedEmail, _, _ := auth.GetUserInfo(accessToken); fetchedEmail != "" {
+			email = fetchedEmail
+		}
 	}
-	if newRefreshToken != "" {
-		req.RefreshToken = newRefreshToken
+	if profileArn == "" {
+		profileArn = req.ProfileArn // external_idp refresh returns no profileArn
 	}
-
-	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
 
 	// 创建账号
+	provider := req.Provider
+	if provider == "" && req.AuthMethod == "external_idp" {
+		provider = "AzureAD"
+	}
+	// Reuse a pasted record's id when it does not collide; otherwise mint a fresh
+	// one so re-importing a backup never creates a duplicate entry.
+	id := req.ID
+	if id == "" || config.AccountIDExists(id) {
+		id = auth.GenerateAccountID()
+	}
 	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   newProfileArn,
+		ID:            id,
+		Email:         email,
+		AccessToken:   accessToken,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Provider:      provider,
+		Region:        req.Region,
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+		ProfileArn:    profileArn,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
+		Scopes:        req.Scopes,
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -2989,16 +3308,71 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// externalIdpAuthMethodAliases are lower-cased authMethod values (or Kiro Account
+// Manager provider labels) that mean "external IdP / enterprise SSO" and must
+// normalize to "external_idp".
+var externalIdpAuthMethodAliases = map[string]bool{
+	"external_idp": true,
+	"azuread":      true,
+	"azure":        true,
+	"entra":        true,
+	"entra-id":     true,
+	"entra_id":     true,
+	"microsoft":    true,
+	"m365":         true,
+	"office365":    true,
+	"external":     true,
+}
+
+// normalizeImportAuthMethod maps a pasted credential JSON's authMethod (plus its
+// clientId/clientSecret/tokenEndpoint) onto one of the three canonical methods
+// ("external_idp" | "idc" | "social"). external_idp MUST be detected before the
+// clientId+clientSecret→idc inference, because external_idp accounts carry clientId
+// but NO clientSecret, so the old default branch misclassified them as "social" and
+// refresh hit the wrong endpoint.
+//
+// It preserves the pre-existing idc/social heuristics:
+//   - empty authMethod + clientId present             -> idc
+//   - empty authMethod, no clientId                   -> social
+//   - "enterprise" (Kiro Account Manager IdC label)   -> idc
+//   - unrecognized non-empty + clientId+clientSecret  -> idc, else social
+func normalizeImportAuthMethod(authMethod, clientID, clientSecret, tokenEndpoint string) string {
+	am := strings.ToLower(strings.TrimSpace(authMethod))
+	switch {
+	case externalIdpAuthMethodAliases[am]:
+		return "external_idp"
+	case am == "social" || am == "google" || am == "github":
+		return "social"
+	case am == "idc" || am == "builderid" || am == "enterprise":
+		return "idc"
+	case tokenEndpoint != "":
+		// Infer external_idp from a tokenEndpoint only when authMethod does not
+		// explicitly say otherwise — a stray tokenEndpoint key in a pasted social/
+		// idc record must not silently flip the account to external_idp.
+		return "external_idp"
+	}
+	if am == "" {
+		if clientID != "" {
+			return "idc"
+		}
+		return "social"
+	}
+	if clientID != "" && clientSecret != "" {
+		return "idc"
+	}
+	return "social"
+}
+
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":         config.Version,
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
-		"totalRequests":   h.totalRequests,
-		"successRequests": h.successRequests,
-		"failedRequests":  h.failedRequests,
-		"totalTokens":     h.totalTokens,
-		"totalCredits":    h.totalCredits,
+		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
+		"successRequests": atomic.LoadInt64(&h.successRequests),
+		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":    h.getCredits(),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
@@ -3531,17 +3905,23 @@ func applyProxyConfig(proxyURL string) {
 	auth.InitHttpClient(proxyURL)
 }
 
-// apiGetProxy 获取当前代理配置
+// apiGetProxy returns the outbound mode: the socks5/http proxy URL and whether
+// the egress relay is the selected mode. The two are mutually exclusive.
 func (h *Handler) apiGetProxy(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"proxyURL": config.GetProxyURL(),
+		"useRelay": config.IsRelayEnabled(),
 	})
 }
 
-// apiUpdateProxy 更新代理配置并立即生效
+// apiUpdateProxy sets the outbound egress mode. useRelay=true selects the egress
+// relay (and clears any socks5/http proxy); otherwise the proxyURL (possibly
+// empty = Direct) is used and the relay is deselected. Relay and proxy are
+// mutually exclusive outbound modes.
 func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProxyURL string `json:"proxyURL"`
+		UseRelay bool   `json:"useRelay"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3549,7 +3929,26 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 验证代理 URL 格式（非空时）
+	if req.UseRelay {
+		// Selecting the relay: require a configured relay URL, enable it (which
+		// clears the proxy URL), and reset the HTTP clients to direct dialing — the
+		// relay RoundTripper wraps every client and takes over once active.
+		if relayURL, _ := config.GetRelaySettings(); strings.TrimSpace(relayURL) == "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "configure a Relay URL in the Egress Relay section first"})
+			return
+		}
+		if err := config.SetRelayEnabled(true); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		applyProxyConfig("")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		return
+	}
+
+	// Non-relay mode: validate the proxy URL (empty = Direct).
 	if req.ProxyURL != "" {
 		if !strings.HasPrefix(req.ProxyURL, "http://") &&
 			!strings.HasPrefix(req.ProxyURL, "https://") &&
@@ -3560,17 +3959,185 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
+	if err := config.SetRelayEnabled(false); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	if err := config.UpdateProxySettings(req.ProxyURL); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-
-	// 立即应用新的代理配置
 	applyProxyConfig(req.ProxyURL)
-
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiGetRelay returns the egress relay config. The secret is not echoed back in
+// full — only whether one is set — so it is not re-exposed to the admin client.
+func (h *Handler) apiGetRelay(w http.ResponseWriter, r *http.Request) {
+	relayURL, secret := config.GetRelaySettings()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"relayUrl":  relayURL,
+		"hasSecret": secret != "",
+	})
+}
+
+// apiUpdateRelay sets the egress relay URL + shared secret. An empty relayUrl
+// disables the relay (direct / ProxyURL egress resumes). A blank secret in the
+// request keeps the existing one, so the UI can update the URL without re-typing
+// the secret.
+func (h *Handler) apiUpdateRelay(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RelayURL    string `json:"relayUrl"`
+		RelaySecret string `json:"relaySecret"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	req.RelayURL = strings.TrimSpace(req.RelayURL)
+	if req.RelayURL != "" && !strings.HasPrefix(req.RelayURL, "http://") && !strings.HasPrefix(req.RelayURL, "https://") {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "relayUrl must start with http:// or https://"})
+		return
+	}
+	secret := req.RelaySecret
+	if secret == "" {
+		// Preserve the existing secret when the field is left blank.
+		_, secret = config.GetRelaySettings()
+	}
+	if req.RelayURL == "" {
+		secret = "" // clearing the relay clears its secret too
+	}
+	if err := config.UpdateRelaySettings(req.RelayURL, secret); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiTestRelay sends a probe request THROUGH the given (or saved) relay to a
+// harmless upstream and reports what came back, so the operator can verify the
+// relay is reachable, the secret matches, and forwarding works before relying on
+// it. A blank secret in the request falls back to the saved one.
+func (h *Handler) apiTestRelay(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RelayURL    string `json:"relayUrl"`
+		RelaySecret string `json:"relaySecret"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	relayURL := strings.TrimSpace(req.RelayURL)
+	secret := req.RelaySecret
+	savedURL, savedSecret := config.GetRelaySettings()
+	if relayURL == "" {
+		relayURL, secret = savedURL, savedSecret
+	} else if secret == "" {
+		secret = savedSecret
+	}
+	if relayURL == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no relay configured to test"})
+		return
+	}
+
+	// Probe the relay with the X-Relay-Ping header: a ping-aware relay validates
+	// the secret and returns 200 "relay-ok" WITHOUT forwarding, giving a definitive
+	// positive that doesn't depend on what any upstream returns. Older relays
+	// (deployed before ping) ignore the header and forward the request instead —
+	// handled by the classification below. The probe target is a real allow-listed
+	// AWS host so a forwarding relay still gets a valid HTTP response.
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: egress.NewRelayTransportWith(http.DefaultTransport, relayURL, secret),
+	}
+	probeReq, _ := http.NewRequest("GET", "https://oidc.us-east-1.amazonaws.com/", nil)
+	probeReq.Header.Set("X-Relay-Ping", "1")
+	resp, err := client.Do(probeReq)
+	if err != nil {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":    false,
+			"error": "relay unreachable: " + err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	bodyStr := strings.ToLower(strings.TrimSpace(string(body)))
+
+	// Classify. Only a RELAY-level rejection is a failure; an upstream status
+	// (e.g. AWS answering 403 to a bare GET) means the relay forwarded fine.
+	var ok bool
+	var reason string
+	switch {
+	case resp.StatusCode == 200 && strings.Contains(bodyStr, "relay-ok"):
+		ok, reason = true, "ping ok" // ping-aware relay, secret verified
+	case resp.StatusCode == 401 && (bodyStr == "" || strings.Contains(bodyStr, "unauthor")):
+		ok, reason = false, "wrong secret (relay returned 401 unauthorized)"
+	case resp.StatusCode == 403 && strings.Contains(bodyStr, "target not allowed"):
+		ok, reason = false, "target host not on the relay allow-list"
+	default:
+		// Any other HTTP response came back THROUGH the relay from upstream.
+		ok, reason = true, "forwarded to upstream"
+	}
+	out := map[string]interface{}{
+		"ok":     ok,
+		"status": resp.StatusCode,
+		"detail": reason,
+	}
+	if !ok {
+		out["error"] = reason
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
+// apiGetRelaySource returns the embedded relay source for a platform with the
+// shared secret BAKED IN, so the operator only deploys the code — no need to set
+// a RELAY_KEY environment variable on the serverless platform. If no relay secret
+// exists yet, one is generated and persisted (keeping any URL already entered) so
+// the baked code and the app agree on the secret.
+func (h *Handler) apiGetRelaySource(w http.ResponseWriter, r *http.Request) {
+	platform := strings.TrimSpace(r.URL.Query().Get("platform"))
+	src, ok := relay.SourceFor(platform)
+	if !ok {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "unknown platform (want cloudflare|vercel|deno)"})
+		return
+	}
+
+	relayURL, secret := config.GetRelaySettings()
+	if secret == "" {
+		secret = generateRelaySecret()
+		if err := config.UpdateRelaySettings(relayURL, secret); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	// secret is URL-safe base64 (no quotes/backslashes), so it drops safely into
+	// the JS/TS string literal placeholder.
+	src.Code = strings.ReplaceAll(src.Code, "__RELAY_KEY__", secret)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"platform": src.Platform,
+		"filename": src.Filename,
+		"language": src.Language,
+		"code":     src.Code,
+		"secret":   secret,
+	})
+}
+
+// generateRelaySecret returns a 256-bit URL-safe random token for the relay
+// shared secret.
+func generateRelaySecret() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "relay-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // apiGetVersion 获取版本信息

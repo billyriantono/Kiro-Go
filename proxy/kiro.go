@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/egress"
 	"kiro-go/logger"
 	"net/http"
 	"net/url"
@@ -72,7 +73,7 @@ func GetClientForProxy(proxyURL string) *http.Client {
 	}
 	client := &http.Client{
 		Timeout:   5 * time.Minute,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: egress.NewRelayTransport(buildKiroTransport(proxyURL)),
 	}
 	proxyClientCache.Store(proxyURL, client)
 	return client
@@ -90,7 +91,7 @@ func GetRestClientForProxy(proxyURL string) *http.Client {
 	}
 	client := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: egress.NewRelayTransport(buildKiroTransport(proxyURL)),
 	}
 	proxyClientCache.Store(cacheKey, client)
 	return client
@@ -130,13 +131,13 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
 		Timeout:   5 * time.Minute,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: egress.NewRelayTransport(buildKiroTransport(proxyURL)),
 	}
 	kiroHttpStore.Store(client)
 
 	restClient := &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildKiroTransport(proxyURL),
+		Transport: egress.NewRelayTransport(buildKiroTransport(proxyURL)),
 	}
 	kiroRestHttpStore.Store(restClient)
 }

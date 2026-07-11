@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"kiro-go/logger"
 	"os"
 	"runtime"
 	"sync"
@@ -45,13 +46,21 @@ type Account struct {
 	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC) or "social" (GitHub/Google)
-	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub")
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "external_idp" (enterprise SSO, e.g. Azure AD)
+	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
 	Region       string `json:"region"`                 // AWS region for OIDC endpoints
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
 	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests
+
+	// External IdP (enterprise SSO, e.g. Microsoft 365 / Entra ID / Azure AD) refresh material.
+	// When AuthMethod == "external_idp" the credential is an IdP-issued OAuth token refreshed
+	// against TokenEndpoint using ClientID and Scopes (refresh_token grant), NOT the AWS SSO
+	// OIDC endpoint. IssuerURL is the OIDC issuer the endpoints were discovered from.
+	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint (refresh)
+	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer URL
+	Scopes        string `json:"scopes,omitempty"`        // Space-separated scopes granted by the external IdP
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -180,6 +189,17 @@ type Config struct {
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// Egress relay: an alternative to ProxyURL. The relay only routes traffic when
+	// RelayEnabled is true (the operator selects "Egress Relay" as the outbound
+	// mode) — a stored RelayURL alone does NOT activate it, so URL/secret can be
+	// configured while the outbound stays Direct/proxy. When active, upstream
+	// requests go through a serverless forwarder (Cloudflare/Vercel/Deno) so AWS
+	// sees the relay's IP. RelaySecret is the shared secret (X-Relay-Key). See
+	// package egress and relay/.
+	RelayEnabled bool   `json:"relayEnabled,omitempty"`
+	RelayURL     string `json:"relayURL,omitempty"`
+	RelaySecret  string `json:"relaySecret,omitempty"`
+
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
 	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
@@ -238,42 +258,98 @@ var (
 	cfg     *Config
 	cfgLock sync.RWMutex
 	cfgPath string
+	store   Store
 )
 
-// Init initializes the configuration system with the specified file path.
-// If the file doesn't exist, a default configuration is created.
+// Init initializes the configuration system. path is the JSON config file used
+// by the default (file) backend; when DB_DRIVER / DATABASE_URL select a SQL
+// backend, path still supplies the default SQLite location and the one-time
+// import source for an existing config.json.
 func Init(path string) error {
 	cfgPath = path
+	st, err := newStore(path)
+	if err != nil {
+		return err
+	}
+	store = st
+	logger.Infof("[config] storage backend: %s", st.Backend())
 	return Load()
 }
 
+// Load reads the config from the active store, seeding a default on a fresh
+// backend and running the one-time JSON→SQL import when applicable.
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
+	if store == nil {
+		store = &jsonStore{path: cfgPath}
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		return err
+	}
+
+	if loaded == nil {
+		// Fresh backend. If a SQL backend is empty but a legacy config.json exists,
+		// import it once so operators migrate their accounts by just setting
+		// DB_DRIVER; otherwise seed a first-run default.
+		if imported := importLegacyJSON(); imported != nil {
+			cfg = imported
+			if err := saveLocked(); err != nil {
+				return err
+			}
+			logger.Infof("[config] migrated existing config.json into the %s backend (%d accounts, %d api keys)",
+				store.Backend(), len(cfg.Accounts), len(cfg.ApiKeys))
+			return migrateLoaded()
+		}
+		// Create default configuration.
+		// Password is intentionally EMPTY: an empty password marks the instance as
+		// "not yet configured" so the admin UI forces the initial-setup screen
+		// instead of shipping a known default. Binds to 0.0.0.0 for container use.
+		cfg = &Config{
+			Password:      "",
+			Port:          8080,
+			Host:          "0.0.0.0",
+			RequireApiKey: false,
+			Accounts:      []Account{},
+		}
+		logger.Infof("[config] fresh %s backend initialized (no data to migrate) — complete initial setup at /admin", store.Backend())
+		return saveLocked()
+	}
+
+	cfg = loaded
+	logger.Infof("[config] loaded from %s backend (%d accounts, %d api keys, configured=%t)",
+		store.Backend(), len(cfg.Accounts), len(cfg.ApiKeys), cfg.Password != "")
+	return migrateLoaded()
+}
+
+// importLegacyJSON reads an existing config.json when the SQL backend is empty,
+// so switching to SQL migrates the operator's data automatically. Returns nil
+// when there is nothing to import (file backend, or no JSON file present).
+func importLegacyJSON() *Config {
+	if _, isFile := store.(*jsonStore); isFile {
+		return nil // file backend: nothing to migrate into
+	}
+	if cfgPath == "" {
+		return nil
+	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Create default configuration.
-			// Binds to 0.0.0.0 by default for Docker/container compatibility.
-			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
-			}
-			return saveLocked()
-		}
-		return err
+		return nil
 	}
-
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
-		return err
+		return nil
 	}
-	cfg = &c
+	return &c
+}
 
+// migrateLoaded applies the in-place field migrations that must run after any
+// successful load (legacy single ApiKey → ApiKeys, per-account AllowOverage →
+// OverageStatus). Caller MUST hold cfgLock.
+func migrateLoaded() error {
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
 	// RequireApiKey state — if the legacy deployment was public (RequireApiKey=false),
@@ -319,7 +395,7 @@ func Load() error {
 	return nil
 }
 
-// saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
+// saveLocked persists cfg via the active store. Caller MUST already hold cfgLock.
 // This is identical to Save() (which does not take the lock either) but is named
 // distinctly so call sites that already hold cfgLock are explicit about it.
 func saveLocked() error {
@@ -331,14 +407,14 @@ func newUUID() string {
 	return GenerateMachineId()
 }
 
-// Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Save persists the current configuration through the active store (atomic JSON
+// file write, or a single SQL transaction). Callers already hold cfgLock (all
+// accessors do); the store implementations are safe for that usage.
 func Save() error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
+	if store == nil {
+		store = &jsonStore{path: cfgPath}
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	return store.Save(cfg)
 }
 
 // SetPassword updates the admin password.
@@ -379,6 +455,28 @@ func GetPassword() string {
 	return cfg.Password
 }
 
+// IsConfigured reports whether the instance has completed initial setup, i.e. an
+// admin password has been set. A fresh install seeds an EMPTY password so the
+// admin UI forces the initial-setup screen instead of shipping a known default.
+func IsConfigured() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg != nil && cfg.Password != ""
+}
+
+// CompleteSetup sets the admin password during first-run setup and persists it.
+// It refuses to run once a password already exists so the unauthenticated setup
+// endpoint cannot be used to overwrite the credentials of a configured instance.
+func CompleteSetup(password string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Password != "" {
+		return fmt.Errorf("already configured")
+	}
+	cfg.Password = password
+	return Save()
+}
+
 func GetPort() int {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -405,6 +503,23 @@ func GetAccounts() []Account {
 	return accounts
 }
 
+// AccountIDExists reports whether an account with the given ID is already stored.
+// Used by the credential-import path to reuse a pasted record's id when it does
+// not collide, so re-importing a backup never creates a duplicate entry.
+func AccountIDExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, a := range cfg.Accounts {
+		if a.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func GetEnabledAccounts() []Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -420,6 +535,17 @@ func GetEnabledAccounts() []Account {
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	// Reject a duplicate id under the write lock. The import path pre-checks with
+	// AccountIDExists (RLock) and mints a fresh id on collision, but that check and this
+	// append are not atomic; two concurrent imports of the same pasted id could both
+	// pass the pre-check. This makes "add if id absent" the atomic invariant.
+	if account.ID != "" {
+		for _, a := range cfg.Accounts {
+			if a.ID == account.ID {
+				return fmt.Errorf("account with id %s already exists", account.ID)
+			}
+		}
+	}
 	cfg.Accounts = append(cfg.Accounts, account)
 	return Save()
 }
@@ -816,6 +942,61 @@ func UpdateProxySettings(proxyURL string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
+	return Save()
+}
+
+// GetRelaySettings returns the stored egress relay URL and shared secret,
+// regardless of whether the relay is currently the active outbound mode. Used by
+// the admin config/test/source flows.
+func GetRelaySettings() (string, string) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return "", ""
+	}
+	return cfg.RelayURL, cfg.RelaySecret
+}
+
+// IsRelayEnabled reports whether the egress relay is the selected outbound mode.
+func IsRelayEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg != nil && cfg.RelayEnabled
+}
+
+// ActiveRelay returns the relay URL + secret ONLY when the relay is the active
+// outbound mode and a URL is configured; otherwise ("", ""). The egress transport
+// uses this so a stored-but-unselected relay stays dormant.
+func ActiveRelay() (string, string) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || !cfg.RelayEnabled || cfg.RelayURL == "" {
+		return "", ""
+	}
+	return cfg.RelayURL, cfg.RelaySecret
+}
+
+// UpdateRelaySettings sets the egress relay URL and shared secret and persists
+// them. It does NOT change the enabled state (activation is via the outbound mode
+// selector) — configuring a relay while another outbound mode is active is fine.
+func UpdateRelaySettings(relayURL, relaySecret string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.RelayURL = relayURL
+	cfg.RelaySecret = relaySecret
+	return Save()
+}
+
+// SetRelayEnabled selects (or deselects) the egress relay as the outbound mode.
+// Enabling the relay clears any socks5/http ProxyURL since the two are mutually
+// exclusive outbound modes.
+func SetRelayEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.RelayEnabled = enabled
+	if enabled {
+		cfg.ProxyURL = ""
+	}
 	return Save()
 }
 
