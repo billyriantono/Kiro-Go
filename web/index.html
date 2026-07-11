@@ -61,7 +61,7 @@
       </div>
     </header>
     <main class="login-main">
-      <div class="login-box">
+      <div class="login-box" id="loginBox">
         <h1 class="login-title" data-i18n="login.title"></h1>
         <p class="login-subtitle" data-i18n="login.subtitle"></p>
         <div class="form-group">
@@ -85,6 +85,30 @@
           <span data-i18n="login.submit"></span>
         </button>
 
+      </div>
+
+      <!-- First-run initial setup (shown when the instance has no admin password yet) -->
+      <div class="login-box hidden" id="setupBox">
+        <h1 class="login-title" data-i18n="setup.title"></h1>
+        <p class="login-subtitle" data-i18n="setup.subtitle"></p>
+        <div class="form-group">
+          <label data-i18n="setup.password"></label>
+          <div class="input-affix">
+            <i class="fa-solid fa-lock affix-icon"></i>
+            <input type="password" id="setupPwdField" data-i18n-placeholder="setup.passwordPlaceholder" autocomplete="new-password" />
+          </div>
+        </div>
+        <div class="form-group">
+          <label data-i18n="setup.confirm"></label>
+          <div class="input-affix">
+            <i class="fa-solid fa-lock affix-icon"></i>
+            <input type="password" id="setupPwdConfirm" data-i18n-placeholder="setup.confirmPlaceholder" autocomplete="new-password" />
+          </div>
+        </div>
+        <button type="button" class="btn btn-primary btn-lg w-full" id="setupBtn">
+          <i class="fa-solid fa-circle-check"></i>
+          <span data-i18n="setup.submit"></span>
+        </button>
       </div>
     </main>
   </div>

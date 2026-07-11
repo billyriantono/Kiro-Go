@@ -246,42 +246,92 @@ var (
 	cfg     *Config
 	cfgLock sync.RWMutex
 	cfgPath string
+	store   Store
 )
 
-// Init initializes the configuration system with the specified file path.
-// If the file doesn't exist, a default configuration is created.
+// Init initializes the configuration system. path is the JSON config file used
+// by the default (file) backend; when DB_DRIVER / DATABASE_URL select a SQL
+// backend, path still supplies the default SQLite location and the one-time
+// import source for an existing config.json.
 func Init(path string) error {
 	cfgPath = path
+	st, err := newStore(path)
+	if err != nil {
+		return err
+	}
+	store = st
 	return Load()
 }
 
+// Load reads the config from the active store, seeding a default on a fresh
+// backend and running the one-time JSON→SQL import when applicable.
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
+	if store == nil {
+		store = &jsonStore{path: cfgPath}
+	}
+
+	loaded, err := store.Load()
+	if err != nil {
+		return err
+	}
+
+	if loaded == nil {
+		// Fresh backend. If a SQL backend is empty but a legacy config.json exists,
+		// import it once so operators migrate their accounts by just setting
+		// DB_DRIVER; otherwise seed a first-run default.
+		if imported := importLegacyJSON(); imported != nil {
+			cfg = imported
+			if err := saveLocked(); err != nil {
+				return err
+			}
+			return migrateLoaded()
+		}
+		// Create default configuration.
+		// Password is intentionally EMPTY: an empty password marks the instance as
+		// "not yet configured" so the admin UI forces the initial-setup screen
+		// instead of shipping a known default. Binds to 0.0.0.0 for container use.
+		cfg = &Config{
+			Password:      "",
+			Port:          8080,
+			Host:          "0.0.0.0",
+			RequireApiKey: false,
+			Accounts:      []Account{},
+		}
+		return saveLocked()
+	}
+
+	cfg = loaded
+	return migrateLoaded()
+}
+
+// importLegacyJSON reads an existing config.json when the SQL backend is empty,
+// so switching to SQL migrates the operator's data automatically. Returns nil
+// when there is nothing to import (file backend, or no JSON file present).
+func importLegacyJSON() *Config {
+	if _, isFile := store.(*jsonStore); isFile {
+		return nil // file backend: nothing to migrate into
+	}
+	if cfgPath == "" {
+		return nil
+	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Create default configuration.
-			// Binds to 0.0.0.0 by default for Docker/container compatibility.
-			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
-			}
-			return saveLocked()
-		}
-		return err
+		return nil
 	}
-
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
-		return err
+		return nil
 	}
-	cfg = &c
+	return &c
+}
 
+// migrateLoaded applies the in-place field migrations that must run after any
+// successful load (legacy single ApiKey → ApiKeys, per-account AllowOverage →
+// OverageStatus). Caller MUST hold cfgLock.
+func migrateLoaded() error {
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
 	// RequireApiKey state — if the legacy deployment was public (RequireApiKey=false),
@@ -327,7 +377,7 @@ func Load() error {
 	return nil
 }
 
-// saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
+// saveLocked persists cfg via the active store. Caller MUST already hold cfgLock.
 // This is identical to Save() (which does not take the lock either) but is named
 // distinctly so call sites that already hold cfgLock are explicit about it.
 func saveLocked() error {
@@ -339,14 +389,14 @@ func newUUID() string {
 	return GenerateMachineId()
 }
 
-// Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Save persists the current configuration through the active store (atomic JSON
+// file write, or a single SQL transaction). Callers already hold cfgLock (all
+// accessors do); the store implementations are safe for that usage.
 func Save() error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
+	if store == nil {
+		store = &jsonStore{path: cfgPath}
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	return store.Save(cfg)
 }
 
 // SetPassword updates the admin password.
@@ -385,6 +435,28 @@ func GetPassword() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	return cfg.Password
+}
+
+// IsConfigured reports whether the instance has completed initial setup, i.e. an
+// admin password has been set. A fresh install seeds an EMPTY password so the
+// admin UI forces the initial-setup screen instead of shipping a known default.
+func IsConfigured() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg != nil && cfg.Password != ""
+}
+
+// CompleteSetup sets the admin password during first-run setup and persists it.
+// It refuses to run once a password already exists so the unauthenticated setup
+// endpoint cannot be used to overwrite the credentials of a configured instance.
+func CompleteSetup(password string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg.Password != "" {
+		return fmt.Errorf("already configured")
+	}
+	cfg.Password = password
+	return Save()
 }
 
 func GetPort() int {

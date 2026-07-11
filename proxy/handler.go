@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2145,7 +2146,23 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 // ==================== 管理 API ====================
 
 func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
-	// 验证密码
+	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
+
+	// First-run setup endpoints bypass the password gate BUT only function while
+	// the instance is unconfigured (empty password). This replaces the old
+	// "changeme" default: a fresh deploy has no password and the admin UI forces
+	// the setup screen. setup/status is always readable so the UI can branch.
+	if path == "/setup/status" && r.Method == "GET" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]interface{}{"configured": config.IsConfigured()})
+		return
+	}
+	if path == "/setup" && r.Method == "POST" {
+		h.apiCompleteSetup(w, r)
+		return
+	}
+
+	// 验证密码 — constant-time to avoid leaking length/prefix via comparison timing.
 	password := r.Header.Get("X-Admin-Password")
 	if password == "" {
 		cookie, _ := r.Cookie("admin_password")
@@ -2154,13 +2171,18 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if password != config.GetPassword() {
+	if !config.IsConfigured() {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(401)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Setup required", "setupRequired": "true"})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(password), []byte(config.GetPassword())) != 1 {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, "/admin/api")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	switch {
@@ -2851,6 +2873,39 @@ func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 	if req.SessionID != "" {
 		auth.CancelKiroSsoLogin(req.SessionID)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// apiCompleteSetup handles the first-run initial-setup submission: it sets the
+// admin password on an unconfigured instance. config.CompleteSetup refuses once a
+// password already exists, so this unauthenticated endpoint cannot overwrite the
+// credentials of a configured instance (it only closes the fresh-install window).
+func (h *Handler) apiCompleteSetup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if config.IsConfigured() {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Already configured"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if len(strings.TrimSpace(req.Password)) < 8 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Password must be at least 8 characters"})
+		return
+	}
+	if err := config.CompleteSetup(req.Password); err != nil {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }

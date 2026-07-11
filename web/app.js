@@ -614,6 +614,48 @@
       localStorage.removeItem('kiro_remembered_pwd');
     }
   }
+  // First-run setup: if the instance has no admin password yet, show the setup
+  // box instead of the login form. Returns true when setup is required (so the
+  // caller skips auto-login).
+  async function checkSetup() {
+    try {
+      const res = await fetch('/admin/api/setup/status');
+      const d = await res.json();
+      if (!d.configured) {
+        $('loginBox').classList.add('hidden');
+        $('setupBox').classList.remove('hidden');
+        return true;
+      }
+    } catch (e) { }
+    $('setupBox').classList.add('hidden');
+    $('loginBox').classList.remove('hidden');
+    return false;
+  }
+  async function completeSetup() {
+    const pwd = $('setupPwdField').value;
+    const confirm = $('setupPwdConfirm').value;
+    if (pwd.length < 8) { toast(t('setup.tooShort'), 'error'); return; }
+    if (pwd !== confirm) { toast(t('setup.mismatch'), 'error'); return; }
+    try {
+      const res = await fetch('/admin/api/setup', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pwd })
+      });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        toast(t('setup.success'), 'primary');
+        // Log straight in with the freshly-set password.
+        setActivePassword(pwd, false);
+        $('setupBox').classList.add('hidden');
+        $('loginBox').classList.remove('hidden');
+        showMain(); loadData();
+      } else {
+        toast((d.error || t('common.failed')), 'error');
+      }
+    } catch (e) {
+      toast(t('login.connectError'), 'error');
+    }
+  }
   async function tryAutoLogin() {
     if (!password) return;
     const loginTime = getActiveLoginTime();
@@ -2839,6 +2881,12 @@
     $('loginBtn').addEventListener('click', login);
     $('pwdField').addEventListener('keypress', e => { if (e.key === 'Enter') login(); });
 
+    const setupBtn = $('setupBtn');
+    if (setupBtn) {
+      setupBtn.addEventListener('click', completeSetup);
+      $('setupPwdConfirm').addEventListener('keypress', e => { if (e.key === 'Enter') completeSetup(); });
+    }
+
     const pwdToggle = $('pwdToggle');
     if (pwdToggle) {
       pwdToggle.addEventListener('click', () => {
@@ -3276,7 +3324,8 @@
     const yr = $('footerYear');
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
-    if (password) tryAutoLogin();
+    const setupRequired = await checkSetup();
+    if (!setupRequired && password) tryAutoLogin();
     setInterval(() => {
       if (!$('mainPage').classList.contains('hidden')) loadStats();
     }, 10000);

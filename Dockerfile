@@ -1,5 +1,7 @@
 # builder 阶段始终运行在构建机原生平台（amd64），用 Go 交叉编译目标平台二进制
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+# Go 1.25+ required: the pure-Go SQLite (modernc.org/sqlite) and pgx drivers
+# declare `go 1.25.0` in their modules.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -25,6 +27,12 @@ RUN mkdir -p /app/data
 EXPOSE 8080
 # Enterprise SSO (Microsoft 365) loopback callback port — see docker-compose.yml.
 EXPOSE 3128
-VOLUME /app/data
+
+# No `VOLUME /app/data`: a Dockerfile VOLUME creates a fresh ANONYMOUS volume on
+# every container recreation (orphaning the previous one), so under git-based
+# deployers that recreate the container per deploy — Dokploy Application mode,
+# etc. — data silently resets. Persist /app/data with an EXPLICIT named volume
+# instead: a Volume Mount in the Dokploy UI, or the kiro-data volume in
+# docker-compose.yml.
 
 CMD ["./kiro-go"]

@@ -46,9 +46,18 @@ func main() {
 	// Initialize log level: LOG_LEVEL env var takes priority over config, defaulting to "info".
 	logger.Init(config.GetLogLevel())
 
-	// 环境变量覆盖密码
+	// ADMIN_PASSWORD env var sets/overrides the admin password. This is the
+	// headless setup path — it pre-configures the instance so the first-run setup
+	// screen is skipped (useful for automated/Docker deploys). When unset, a fresh
+	// install starts unconfigured and the admin UI forces the setup screen instead
+	// of shipping a known default password.
 	if envPassword := os.Getenv("ADMIN_PASSWORD"); envPassword != "" {
 		config.SetPassword(envPassword)
+	}
+
+	if !config.IsConfigured() {
+		logger.Warnf("No admin password set — open http://%s:%d/admin to complete initial setup (or set ADMIN_PASSWORD).",
+			config.GetHost(), config.GetPort())
 	}
 
 	// 初始化账号池

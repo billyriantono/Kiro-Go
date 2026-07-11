@@ -20,6 +20,26 @@ services:
       - kiro-data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      # --- Storage backend (optional) -------------------------------------------
+      # Default is the JSON file at CONFIG_PATH (atomic writes). To use SQL instead,
+      # set DB_DRIVER. Data is migrated automatically once from an existing
+      # config.json on first SQL boot.
+      #
+      #   SQLite (single file, no extra service; lives on the data volume):
+      #     - DB_DRIVER=sqlite
+      #     # optional custom path; defaults to kiro.db beside CONFIG_PATH:
+      #     # - DATABASE_URL=/app/data/kiro.db
+      #
+      #   PostgreSQL (point at a managed/Dokploy Postgres):
+      #     - DB_DRIVER=postgres
+      #     - DATABASE_URL=postgres://user:pass@postgres:5432/kiro?sslmode=disable
+      #
+      # --- Admin password --------------------------------------------------------
+      # Leave ADMIN_PASSWORD unset to complete initial setup in the browser on first
+      # visit to /admin (recommended). Set it here for a headless/automated deploy to
+      # skip the setup screen:
+      #   - ADMIN_PASSWORD=change-me-to-something-strong
+      #
       # Bind host for the Enterprise SSO callback listener INSIDE the container.
       # Default (unset) is loopback-only (127.0.0.1/::1), which the published port
       # above cannot reach; 0.0.0.0 lets the forwarded connection land. The callback
